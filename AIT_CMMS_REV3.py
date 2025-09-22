@@ -2718,7 +2718,6 @@ class AITCMMSSystem:
     
         # Add this near the end of __init__, after self.load_equipment_data()
         if self.current_user_role == 'Manager':
-            self.add_backup_button_to_equipment_tab()
             self.add_database_restore_button()  
         if self.current_user_role == 'Manager':
             self.update_equipment_statistics()
@@ -4472,26 +4471,7 @@ class AITCMMSSystem:
         
     
     
-    def add_backup_button_to_equipment_tab(self):
-        """Add backup and restore buttons to equipment tab after GUI is created"""
-        try:
-            if hasattr(self, 'backup_sync_dir') and hasattr(self, 'equipment_frame'):
-                # Find the controls frame and add the buttons
-                for widget in self.equipment_frame.winfo_children():
-                    if isinstance(widget, ttk.LabelFrame) and "Equipment Controls" in widget['text']:
-                        # Existing backup buttons
-                        #ttk.Button(widget, text="📁 Open Backup Folder", 
-                               # command=lambda: os.startfile(self.backup_sync_dir)).pack(side='left', padx=5)
-                        #ttk.Button(widget, text="💾 Test Backup Now", 
-                               # command=self.test_backup_now).pack(side='left', padx=5)
-                    
-                        # NEW: Add restore button
-                        ttk.Button(widget, text="📥 Restore from Backup", 
-                                command=self.create_database_restore_dialog,
-                                style='Accent.TButton').pack(side='left', padx=5)
-                        break
-        except Exception as e:
-            print(f"Error adding backup/restore buttons: {e}")
+    
     
     
     
@@ -5236,17 +5216,18 @@ class AITCMMSSystem:
         # Load current month by default
         self.load_monthly_data(month_var, year_var, monthly_tree, summary_text)
 
+    
     def load_monthly_data(self, month_var, year_var, tree, summary_text):
-        """Load PM completion data for selected month/year"""
+        """Load PM completion data for selected month/year with debugging"""
         try:
             # Parse month and year
             month_text = month_var.get()
             month_num = month_text.split(' - ')[0] if month_text else f"{datetime.now().month:02d}"
             year = year_var.get() or str(datetime.now().year)
-        
+    
             # Calculate date range for the month
             start_date = f"{year}-{month_num}-01"
-        
+    
             # Get last day of month
             year_int = int(year)
             month_int = int(month_num)
@@ -5256,11 +5237,14 @@ class AITCMMSSystem:
             else:
                 next_month = month_int + 1
                 next_year = year_int
-        
+    
             end_date = (datetime(next_year, next_month, 1) - timedelta(days=1)).strftime('%Y-%m-%d')
-        
+    
             cursor = self.conn.cursor()
         
+            # DEBUG: Print date range
+            print(f"DEBUG: Searching date range: {start_date} to {end_date}")
+    
             # Get PM completions for the month
             cursor.execute('''
                 SELECT 
@@ -5276,9 +5260,10 @@ class AITCMMSSystem:
                 WHERE pc.completion_date BETWEEN ? AND ?
                 ORDER BY pc.completion_date DESC, pc.bfm_equipment_no
             ''', (start_date, end_date))
-        
+    
             completions = cursor.fetchall()
-        
+            print(f"DEBUG: PM completions found: {len(completions)}")
+    
             # Get Cannot Find entries for the month
             cursor.execute('''
                 SELECT 
@@ -5293,17 +5278,198 @@ class AITCMMSSystem:
                 WHERE cf.report_date BETWEEN ? AND ?
                 ORDER BY cf.report_date DESC, cf.bfm_equipment_no
             ''', (start_date, end_date))
-        
+    
             cannot_finds = cursor.fetchall()
+            print(f"DEBUG: Cannot find entries found: {len(cannot_finds)}")
         
+            # DEBUG: Check for any dates outside expected range
+            cursor.execute('''
+                SELECT completion_date, COUNT(*) 
+                FROM pm_completions 
+                WHERE strftime('%Y-%m', completion_date) = ? 
+                GROUP BY completion_date 
+                ORDER BY completion_date
+            ''', (f"{year}-{month_num}",))
+        
+            date_counts = cursor.fetchall()
+            print(f"DEBUG: All PM completion dates this month: {date_counts}")
+        
+            cursor.execute('''
+                SELECT report_date, COUNT(*) 
+                FROM cannot_find_assets 
+                WHERE strftime('%Y-%m', report_date) = ? 
+                GROUP BY report_date 
+                ORDER BY report_date
+            ''', (f"{year}-{month_num}",))
+        
+            cf_date_counts = cursor.fetchall()
+            print(f"DEBUG: All cannot find dates this month: {cf_date_counts}")
+        
+            # Try alternative query to see if we get different results
+            cursor.execute('''
+                SELECT COUNT(*) FROM pm_completions 
+                WHERE strftime('%Y-%m', completion_date) = ?
+            ''', (f"{year}-{month_num}",))
+            alt_pm_count = cursor.fetchone()[0]
+        
+            cursor.execute('''
+                SELECT COUNT(*) FROM cannot_find_assets 
+                WHERE strftime('%Y-%m', report_date) = ?
+            ''', (f"{year}-{month_num}",))
+            alt_cf_count = cursor.fetchone()[0]
+        
+            print(f"DEBUG: Alternative count - PM: {alt_pm_count}, CF: {alt_cf_count}, Total: {alt_pm_count + alt_cf_count}")
+            
+            # Add this debug query after the other debug queries:
+            cursor.execute('SELECT COUNT(*) FROM pm_completions')
+            total_pm_all = cursor.fetchone()[0]
+
+            cursor.execute('SELECT COUNT(*) FROM cannot_find_assets') 
+            total_cf_all = cursor.fetchone()[0]
+
+            print(f"DEBUG: Total records in entire database - PM: {total_pm_all}, CF: {total_cf_all}")
+
+            # Also check what months/years you have data for:
+            cursor.execute("SELECT DISTINCT strftime('%Y-%m', completion_date) FROM pm_completions ORDER BY 1")
+            pm_months = [row[0] for row in cursor.fetchall()]
+
+            cursor.execute("SELECT DISTINCT strftime('%Y-%m', report_date) FROM cannot_find_assets ORDER BY 1") 
+            cf_months = [row[0] for row in cursor.fetchall()]
+
+            print(f"DEBUG: PM completion months available: {pm_months}")
+            print(f"DEBUG: Cannot find months available: {cf_months}")
+            
+            # Add this debug query:
+            cursor.execute('SELECT COUNT(*) FROM pm_completions WHERE completion_date IS NULL')
+            null_pm_count = cursor.fetchone()[0]
+
+            cursor.execute('SELECT COUNT(*) FROM cannot_find_assets WHERE report_date IS NULL')
+            null_cf_count = cursor.fetchone()[0]
+
+            print(f"DEBUG: Records with NULL dates - PM: {null_pm_count}, CF: {null_cf_count}")
+
+            # Also check what those NULL records look like:
+            if null_pm_count > 0:
+                cursor.execute('SELECT bfm_equipment_no, pm_type, technician_name FROM pm_completions WHERE completion_date IS NULL LIMIT 5')
+                null_samples = cursor.fetchall()
+                print(f"DEBUG: Sample NULL date PM records: {null_samples}")
+
+
+            # Add these debug queries to see the most recent entries:
+            cursor.execute('''
+                SELECT completion_date, COUNT(*) 
+                FROM pm_completions 
+                WHERE completion_date >= '2025-09-01' 
+                GROUP BY completion_date 
+                ORDER BY completion_date DESC
+            ''')
+            recent_entries = cursor.fetchall()
+            print(f"DEBUG: All September PM entries by date: {recent_entries}")
+
+            # Check the very last entries added to see if there's recent data entry:
+            cursor.execute('''
+                SELECT completion_date, bfm_equipment_no, pm_type, technician_name
+                FROM pm_completions 
+                WHERE completion_date LIKE '2025-09%'
+                ORDER BY rowid DESC 
+                LIMIT 10
+            ''')
+            latest_entries = cursor.fetchall()
+            print(f"DEBUG: Latest 10 September entries: {latest_entries}")
+            
+            # Add this debug to find ALL records with single-digit month format:
+            cursor.execute('''
+                SELECT completion_date, COUNT(*) 
+                FROM pm_completions 
+                WHERE completion_date LIKE '2025-9-%'
+                GROUP BY completion_date 
+                ORDER BY completion_date
+            ''')
+            single_digit_pm = cursor.fetchall()
+
+            cursor.execute('''
+                SELECT report_date, COUNT(*) 
+                FROM cannot_find_assets 
+                WHERE report_date LIKE '2025-9-%'
+                GROUP BY report_date 
+                ORDER BY report_date
+            ''')
+            single_digit_cf = cursor.fetchall()
+
+            cursor.execute('SELECT COUNT(*) FROM pm_completions WHERE completion_date LIKE "2025-9-%"')
+            total_single_pm = cursor.fetchone()[0]
+
+            cursor.execute('SELECT COUNT(*) FROM cannot_find_assets WHERE report_date LIKE "2025-9-%"')
+            total_single_cf = cursor.fetchone()[0]
+
+            print(f"DEBUG: Single-digit month PM records: {single_digit_pm}")
+            print(f"DEBUG: Single-digit month CF records: {single_digit_cf}")
+            print(f"DEBUG: Total single-digit format - PM: {total_single_pm}, CF: {total_single_cf}")
+            print(f"DEBUG: Missing total would be: {224 + total_single_pm + total_single_cf}")
+
+
+            # Add these debug queries to check for ALL possible date variations:
+
+            # Check for dates with different separators or formats
+            cursor.execute('''
+                SELECT completion_date, COUNT(*) 
+                FROM pm_completions 
+                WHERE (completion_date LIKE '%2025%' AND completion_date LIKE '%9%')
+                OR (completion_date LIKE '%25-9%')
+                OR (completion_date LIKE '%25/9%')
+                GROUP BY completion_date 
+                ORDER BY completion_date
+            ''')
+            all_sept_variations = cursor.fetchall()
+
+            # Check the total count using strftime for September (this handles all formats)
+            cursor.execute('''
+                SELECT completion_date, COUNT(*)
+                FROM pm_completions 
+                WHERE (strftime('%Y', completion_date) = '2025' AND strftime('%m', completion_date) = '09')
+                OR (strftime('%Y', completion_date) = '2025' AND strftime('%m', completion_date) = '9')
+                GROUP BY completion_date
+                ORDER BY completion_date
+            ''')
+            strftime_sept = cursor.fetchall()
+
+            cursor.execute('''
+                SELECT COUNT(*)
+                FROM pm_completions 
+                WHERE (strftime('%Y', completion_date) = '2025' AND strftime('%m', completion_date) = '09')
+                OR (strftime('%Y', completion_date) = '2025' AND strftime('%m', completion_date) = '9')
+            ''')
+            total_strftime_pm = cursor.fetchone()[0]
+
+            # Same for cannot_find_assets
+            cursor.execute('''
+                SELECT COUNT(*)
+                FROM cannot_find_assets 
+                WHERE (strftime('%Y', report_date) = '2025' AND strftime('%m', report_date) = '09')
+                OR (strftime('%Y', report_date) = '2025' AND strftime('%m', report_date) = '9')
+            ''')
+            total_strftime_cf = cursor.fetchone()[0]
+
+            print(f"DEBUG: All Sept variations found: {all_sept_variations}")
+            print(f"DEBUG: Strftime September entries: {strftime_sept}")
+            print(f"DEBUG: Total using strftime - PM: {total_strftime_pm}, CF: {total_strftime_cf}, Total: {total_strftime_pm + total_strftime_cf}")
+
+            # Also check if there might be records in other tables
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            all_tables = [row[0] for row in cursor.fetchall()]
+            print(f"DEBUG: All tables in database: {all_tables}")
+
+
             # Combine both lists
             all_completions = list(completions) + list(cannot_finds)
             all_completions.sort(key=lambda x: x[0], reverse=True)  # Sort by date descending
         
+            print(f"DEBUG: Combined total: {len(all_completions)}")
+
             # Clear existing items
             for item in tree.get_children():
                 tree.delete(item)
-        
+
             # Add completions to tree
             for completion in all_completions:
                 date, bfm_no, description, pm_type, technician, hours, notes = completion
@@ -5313,17 +5479,17 @@ class AITCMMSSystem:
                 tree.insert('', 'end', values=(
                     date, bfm_no, description or '', pm_type, technician, hours_display, notes_preview
                 ))
-        
+
             # Generate summary
             month_name = calendar.month_name[month_int]
             summary = f"PM COMPLETIONS SUMMARY - {month_name} {year}\n"
             summary += "=" * 50 + "\n\n"
-        
+
             # Count by PM type
             pm_type_counts = {}
             total_hours = 0
             technician_counts = {}
-        
+
             for completion in all_completions:
                 pm_type = completion[3]
                 technician = completion[4]
@@ -5332,30 +5498,32 @@ class AITCMMSSystem:
                 pm_type_counts[pm_type] = pm_type_counts.get(pm_type, 0) + 1
                 total_hours += hours
                 technician_counts[technician] = technician_counts.get(technician, 0) + 1
-        
+
             summary += f"Total Completions: {len(all_completions)}\n"
             summary += f"Total Labor Hours: {total_hours:.1f} hours\n\n"
-        
+
             if pm_type_counts:
                 summary += "BY PM TYPE:\n"
                 for pm_type, count in sorted(pm_type_counts.items()):
                     summary += f"  {pm_type}: {count}\n"
                 summary += "\n"
-        
+
             if technician_counts:
                 summary += "BY TECHNICIAN:\n"
                 for tech, count in sorted(technician_counts.items()):
                     avg_hours = sum(c[5] or 0 for c in all_completions if c[4] == tech) / count
                     summary += f"  {tech}: {count} completions, {avg_hours:.1f}h avg\n"
-        
+
             # Display summary
             summary_text.delete('1.0', 'end')
             summary_text.insert('1.0', summary)
-        
+
             self.update_status(f"Loaded {len(all_completions)} completions for {month_name} {year}")
-        
+
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load monthly data: {str(e)}")
+    
+    
 
     def export_monthly_data(self, month_var, year_var):
         """Export monthly completion data to CSV"""
@@ -5557,46 +5725,56 @@ class AITCMMSSystem:
         self.load_run_to_failure_assets()
 
 
-        # Enhanced Weekly Reports with Historical Week Selection
-        
     
-    
-    
-    
-    
-        # Add this to your AITCMMSSystem class - Enhanced CM tab with SharePoint integration
-
     def create_cm_management_tab(self):
-        """Enhanced Corrective Maintenance management tab with SharePoint integration"""
+        """Enhanced Corrective Maintenance management tab with SharePoint integration and filter"""
         self.cm_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.cm_frame, text="Corrective Maintenance")
-    
+
         # CM controls - Enhanced with SharePoint button
         controls_frame = ttk.LabelFrame(self.cm_frame, text="CM Controls", padding=10)
         controls_frame.pack(fill='x', padx=10, pady=5)
+
+        # First row of controls
+        controls_row1 = ttk.Frame(controls_frame)
+        controls_row1.pack(fill='x', pady=(0, 5))
     
-        ttk.Button(controls_frame, text="Create New CM", 
+        ttk.Button(controls_row1, text="Create New CM", 
                 command=self.create_cm_dialog).pack(side='left', padx=5)
-        ttk.Button(controls_frame, text="Edit CM", 
+        ttk.Button(controls_row1, text="Edit CM", 
                 command=self.edit_cm_dialog).pack(side='left', padx=5)
-        ttk.Button(controls_frame, text="Complete CM", 
+        ttk.Button(controls_row1, text="Complete CM", 
                 command=self.complete_cm_dialog).pack(side='left', padx=5)
-        ttk.Button(controls_frame, text="Refresh CM List", 
-                command=self.load_corrective_maintenance).pack(side='left', padx=5)
-    
+        ttk.Button(controls_row1, text="Refresh CM List", 
+                command=self.load_corrective_maintenance_with_filter).pack(side='left', padx=5)
+
+        # Filter controls
+        filter_frame = ttk.Frame(controls_frame)
+        filter_frame.pack(fill='x')
         
+        ttk.Label(filter_frame, text="Filter by Status:").pack(side='left', padx=(0, 5))
     
-       
+        # Create filter dropdown
+        self.cm_filter_var = tk.StringVar(value="All")
+        self.cm_filter_dropdown = ttk.Combobox(filter_frame, textvariable=self.cm_filter_var, 
+                                            values=["All", "Open", "In Progress", "Completed", "On Hold"],
+                                            state="readonly", width=15)
+        self.cm_filter_dropdown.pack(side='left', padx=5)
+        self.cm_filter_dropdown.bind('<<ComboboxSelected>>', self.filter_cm_list)
     
+        # Clear filter button
+        ttk.Button(filter_frame, text="Clear Filter", 
+                command=self.clear_cm_filter).pack(side='left', padx=5)
+
         # CM list with enhanced columns for SharePoint data
         cm_list_frame = ttk.LabelFrame(self.cm_frame, text="Corrective Maintenance List", padding=10)
         cm_list_frame.pack(fill='both', expand=True, padx=10, pady=5)
-    
+
         # Enhanced treeview with additional columns
         self.cm_tree = ttk.Treeview(cm_list_frame,
                                 columns=('CM Number', 'BFM', 'Description', 'Priority', 'Assigned', 'Status', 'Created', 'Source'),
                                 show='headings')
-    
+
         cm_columns = {
             'CM Number': 120,
             'BFM': 120,
@@ -5607,27 +5785,75 @@ class AITCMMSSystem:
             'Created': 100,
             'Source': 80  # New column to show if from SharePoint
         }
-    
+
         for col, width in cm_columns.items():
             self.cm_tree.heading(col, text=col)
             self.cm_tree.column(col, width=width)
-    
+
         # Scrollbars
         cm_v_scrollbar = ttk.Scrollbar(cm_list_frame, orient='vertical', command=self.cm_tree.yview)
         cm_h_scrollbar = ttk.Scrollbar(cm_list_frame, orient='horizontal', command=self.cm_tree.xview)
         self.cm_tree.configure(yscrollcommand=cm_v_scrollbar.set, xscrollcommand=cm_h_scrollbar.set)
-    
+
         # Pack treeview and scrollbars
         self.cm_tree.grid(row=0, column=0, sticky='nsew')
         cm_v_scrollbar.grid(row=0, column=1, sticky='ns')
         cm_h_scrollbar.grid(row=1, column=0, sticky='ew')
-    
+
         cm_list_frame.grid_rowconfigure(0, weight=1)
         cm_list_frame.grid_columnconfigure(0, weight=1)
         
+        # Initialize filter data storage
+        self.cm_original_data = []
+        
         # Load CM data
-        self.load_corrective_maintenance()
+        self.load_corrective_maintenance_with_filter()
 
+    def load_corrective_maintenance_with_filter(self):
+        """Wrapper for your existing load method that adds filter support"""
+    
+        # Initialize/clear filter data
+        self.cm_original_data = []
+    
+        # Call your existing load method
+        self.load_corrective_maintenance()
+    
+        # After loading, capture data for filtering
+        for item in self.cm_tree.get_children():
+            item_values = self.cm_tree.item(item, 'values')
+            self.cm_original_data.append(item_values)
+    
+        # Reset filter to show all
+        if hasattr(self, 'cm_filter_var'):
+            self.cm_filter_var.set("All")
+    
+    def filter_cm_list(self, event=None):
+        """Filter the CM list based on selected status"""
+        # Don't filter if no data is loaded yet
+        if not hasattr(self, 'cm_original_data') or not self.cm_original_data:
+         
+            return
+        
+        selected_filter = self.cm_filter_var.get()
+        
+    
+        # Clear current tree
+        for item in self.cm_tree.get_children():
+            self.cm_tree.delete(item)
+    
+        # Filter and display data
+        filtered_count = 0
+        for item_data in self.cm_original_data:
+            # Check if status matches (Status is at index 5)
+            if selected_filter == "All" or (len(item_data) > 5 and str(item_data[5]) == selected_filter):
+                self.cm_tree.insert('', 'end', values=item_data)
+                filtered_count += 1
+        
+    def clear_cm_filter(self):
+        """Clear the filter and show all items"""
+        self.cm_filter_var.set("All")
+        self.filter_cm_list()
+   
     def import_sharepoint_cm_data(self):
         """Import CM data from SharePoint workbook"""
         # Show method selection dialog
