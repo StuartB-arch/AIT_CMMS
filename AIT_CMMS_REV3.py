@@ -24,1192 +24,6 @@ import re
 from pathlib import Path
 
 
-#!/usr/bin/env python3
-"""
-Enhanced PM Completion Form Generator for AIT CMMS
-Automatically generates PDF completion forms after PM completion and manages them in a list
-"""
-
-import os
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-from datetime import datetime, timedelta
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.lib import colors
-import sqlite3
-import shutil
-import subprocess
-import sys
-
-class PMCompletionFormsManager:
-    """Manages PM completion forms generation and storage"""
-    
-    def __init__(self, cmms_system):
-        self.cmms = cmms_system
-        self.conn = cmms_system.conn
-        self.root = cmms_system.root
-        self.init_completion_forms_database()
-        
-        # Create completion forms directory
-        self.forms_directory = "PM_Completion_Forms"
-        os.makedirs(self.forms_directory, exist_ok=True)
-        
-    def init_completion_forms_database(self):
-        """Initialize database table for tracking completion forms"""
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS pm_completion_forms (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                pm_completion_id INTEGER,
-                bfm_equipment_no TEXT,
-                pm_type TEXT,
-                technician_name TEXT,
-                completion_date TEXT,
-                form_filename TEXT,
-                form_path TEXT,
-                generated_date TEXT DEFAULT CURRENT_TIMESTAMP,
-                form_status TEXT DEFAULT 'Generated',
-                FOREIGN KEY (pm_completion_id) REFERENCES pm_completions (id)
-            )
-        ''')
-        self.conn.commit()
-
-    def auto_generate_completion_form_on_pm_submit(self, pm_completion_data):
-        """
-        Automatically generate PM completion form when PM is submitted
-        Call this from the submit_pm_completion method
-        """
-        try:
-            # Extract PM completion data
-            bfm_no = pm_completion_data.get('bfm_equipment_no')
-            pm_type = pm_completion_data.get('pm_type')
-            technician = pm_completion_data.get('technician_name')
-            completion_date = pm_completion_data.get('completion_date')
-            labor_hours = pm_completion_data.get('labor_hours', 0)
-            labor_minutes = pm_completion_data.get('labor_minutes', 0)
-            special_equipment = pm_completion_data.get('special_equipment', '')
-            notes = pm_completion_data.get('notes', '')
-            next_annual_pm = pm_completion_data.get('next_annual_pm_date', '')
-            
-            # Get PM completion ID
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT id FROM pm_completions 
-                WHERE bfm_equipment_no = ? AND pm_type = ? AND technician_name = ? AND completion_date = ?
-                ORDER BY created_date DESC LIMIT 1
-            ''', (bfm_no, pm_type, technician, completion_date))
-            
-            pm_completion_record = cursor.fetchone()
-            if not pm_completion_record:
-                print("Warning: Could not find PM completion record for form generation")
-                return None
-                
-            pm_completion_id = pm_completion_record[0]
-            
-            # Generate unique filename
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            form_filename = f"PM_Completion_{bfm_no}_{pm_type}_{completion_date}_{timestamp}.pdf"
-            form_path = os.path.join(self.forms_directory, form_filename)
-            
-            # Generate the completion form PDF
-            success = self.create_pm_completion_form_pdf(
-                form_path, pm_completion_data, pm_completion_id
-            )
-            
-            if success:
-                # Record the form in database
-                cursor.execute('''
-                    INSERT INTO pm_completion_forms 
-                    (pm_completion_id, bfm_equipment_no, pm_type, technician_name, 
-                     completion_date, form_filename, form_path)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (pm_completion_id, bfm_no, pm_type, technician, 
-                      completion_date, form_filename, form_path))
-                
-                self.conn.commit()
-                
-                print(f"PM completion form generated: {form_filename}")
-                return form_path
-            else:
-                print("Failed to generate PM completion form")
-                return None
-                
-        except Exception as e:
-            print(f"Error generating PM completion form: {e}")
-            return None
-
-    def create_pm_completion_form_pdf(self, file_path, pm_data, pm_completion_id):
-        """Create detailed PM completion form PDF"""
-        try:
-            doc = SimpleDocTemplate(file_path, pagesize=letter,
-                                  rightMargin=36, leftMargin=36,
-                                  topMargin=36, bottomMargin=36)
-            
-            story = []
-            styles = getSampleStyleSheet()
-            
-            # Custom styles
-            title_style = ParagraphStyle(
-                'TitleStyle',
-                parent=styles['Title'],
-                fontSize=16,
-                fontName='Helvetica-Bold',
-                alignment=1,
-                textColor=colors.darkblue,
-                spaceAfter=20
-            )
-            
-            header_style = ParagraphStyle(
-                'HeaderStyle',
-                parent=styles['Normal'],
-                fontSize=10,
-                fontName='Helvetica-Bold',
-                leading=12
-            )
-            
-            cell_style = ParagraphStyle(
-                'CellStyle',
-                parent=styles['Normal'],
-                fontSize=9,
-                leading=11
-            )
-            
-            # Get equipment details
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT sap_material_no, description, tool_id_drawing_no, location, master_lin
-                FROM equipment WHERE bfm_equipment_no = ?
-            ''', (pm_data.get('bfm_equipment_no'),))
-            
-            equipment_info = cursor.fetchone()
-            if equipment_info:
-                sap_no, description, tool_id, location, master_lin = equipment_info
-            else:
-                sap_no = description = tool_id = location = master_lin = "N/A"
-            
-            # Header
-            story.append(Paragraph("AIT - PREVENTIVE MAINTENANCE COMPLETION FORM", title_style))
-            story.append(Spacer(1, 10))
-            
-            # Form metadata
-            metadata_data = [
-                ["Form Generated:", datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
-                 "PM Completion ID:", str(pm_completion_id)],
-                ["Form Type:", "Automated Completion Record", 
-                 "Document Status:", "COMPLETED"]
-            ]
-            
-            metadata_table = Table(metadata_data, colWidths=[1.5*inch, 2*inch, 1.5*inch, 2*inch])
-            metadata_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, -1), colors.lightgrey),
-                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, -1), 8),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('PADDING', (0, 0), (-1, -1), 3)
-            ]))
-            
-            story.append(metadata_table)
-            story.append(Spacer(1, 15))
-            
-            # Equipment Information Section
-            story.append(Paragraph("EQUIPMENT INFORMATION", header_style))
-            
-            equipment_data = [
-                ["SAP Material Number:", Paragraph(str(sap_no), cell_style),
-                 "Tool ID/Drawing No:", Paragraph(str(tool_id), cell_style)],
-                ["BFM Equipment Number:", Paragraph(str(pm_data.get('bfm_equipment_no', '')), cell_style),
-                 "Equipment Description:", Paragraph(str(description), cell_style)],
-                ["Location:", Paragraph(str(location), cell_style),
-                 "Master LIN:", Paragraph(str(master_lin), cell_style)]
-            ]
-            
-            equipment_table = Table(equipment_data, colWidths=[1.5*inch, 2*inch, 1.5*inch, 2*inch])
-            equipment_table.setStyle(TableStyle([
-                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 0), (-1, -1), 9),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
-                ('BACKGROUND', (2, 0), (2, -1), colors.lightgrey),
-                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                ('PADDING', (0, 0), (-1, -1), 4)
-            ]))
-            
-            story.append(equipment_table)
-            story.append(Spacer(1, 15))
-            
-            # PM Details Section
-            story.append(Paragraph("PREVENTIVE MAINTENANCE DETAILS", header_style))
-            
-            total_labor_time = (pm_data.get('labor_hours', 0) or 0) + (pm_data.get('labor_minutes', 0) or 0) / 60
-            
-            pm_details_data = [
-                ["PM Type:", Paragraph(str(pm_data.get('pm_type', '')), cell_style),
-                 "Completion Date:", Paragraph(str(pm_data.get('completion_date', '')), cell_style)],
-                ["Assigned Technician:", Paragraph(str(pm_data.get('technician_name', '')), cell_style),
-                 "Total Labor Time:", Paragraph(f"{total_labor_time:.1f} hours", cell_style)],
-                ["PM Due Date:", Paragraph(str(pm_data.get('pm_due_date', 'N/A')), cell_style),
-                 "Next Annual PM:", Paragraph(str(pm_data.get('next_annual_pm_date', 'N/A')), cell_style)],
-                ["Special Equipment Used:", Paragraph(str(pm_data.get('special_equipment', 'None')), cell_style),
-                 "Form Generation:", Paragraph("Automatic", cell_style)]
-            ]
-            
-            pm_details_table = Table(pm_details_data, colWidths=[1.5*inch, 2*inch, 1.5*inch, 2*inch])
-            pm_details_table.setStyle(TableStyle([
-                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 0), (-1, -1), 9),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
-                ('BACKGROUND', (2, 0), (2, -1), colors.lightgrey),
-                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                ('PADDING', (0, 0), (-1, -1), 4)
-            ]))
-            
-            story.append(pm_details_table)
-            story.append(Spacer(1, 15))
-            
-            # Check if custom template was used
-            custom_template = None
-            if hasattr(self.cmms, 'get_pm_template_for_equipment'):
-                custom_template = self.cmms.get_pm_template_for_equipment(
-                    pm_data.get('bfm_equipment_no'), pm_data.get('pm_type')
-                )
-            
-            # PM Checklist Section
-            if custom_template:
-                story.append(Paragraph("CUSTOM PM CHECKLIST COMPLETED", header_style))
-                checklist_items = custom_template.get('checklist_items', [])
-                template_info = f"Custom template used: {len(checklist_items)} specific steps completed"
-                story.append(Paragraph(template_info, cell_style))
-                
-                # Show first 10 checklist items as completed
-                checklist_data = [["Step", "Task Description", "Status"]]
-                for i, item in enumerate(checklist_items[:10], 1):
-                    checklist_data.append([
-                        str(i),
-                        Paragraph(str(item), cell_style),
-                        "✓ COMPLETED"
-                    ])
-                
-                if len(checklist_items) > 10:
-                    checklist_data.append([
-                        "...",
-                        Paragraph(f"Plus {len(checklist_items) - 10} additional custom steps", cell_style),
-                        "✓ COMPLETED"
-                    ])
-                    
-            else:
-                story.append(Paragraph("STANDARD PM CHECKLIST COMPLETED", header_style))
-                # Standard checklist items
-                standard_items = [
-                    "Special Equipment Used (Listed)",
-                    "Maintenance validated with Date/Stamp/Hours",
-                    "Drawing reference during maintenance",
-                    "Instruments properly calibrated",
-                    "Tool properly identified",
-                    "Mobile mechanisms move fluidly",
-                    "Welds visually inspected",
-                    "Anomalies/defects noted (CM created if needed)",
-                    "Screws checked and tightened",
-                    "Pins checked for wear",
-                    "Tooling secured with cable",
-                    "Tags (BFM and SAP) applied and secured",
-                    "Documentation picked up",
-                    "Parts and tools picked up",
-                    "Workspace cleaned up",
-                    "Dry runs performed",
-                    "AIT Sticker applied"
-                ]
-                
-                checklist_data = [["Step", "Standard Task Description", "Status"]]
-                for i, item in enumerate(standard_items, 1):
-                    checklist_data.append([
-                        str(i),
-                        Paragraph(item, cell_style),
-                        "✓ COMPLETED"
-                    ])
-            
-            checklist_table = Table(checklist_data, colWidths=[0.5*inch, 4.5*inch, 1*inch])
-            checklist_table.setStyle(TableStyle([
-                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 0), (-1, -1), 8),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-                ('BACKGROUND', (2, 1), (2, -1), colors.lightgreen),
-                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                ('PADDING', (0, 0), (-1, -1), 3)
-            ]))
-            
-            story.append(checklist_table)
-            story.append(Spacer(1, 15))
-            
-            # Notes Section
-            if pm_data.get('notes'):
-                story.append(Paragraph("TECHNICIAN NOTES", header_style))
-                notes_data = [[Paragraph(str(pm_data.get('notes', '')), cell_style)]]
-                notes_table = Table(notes_data, colWidths=[7*inch])
-                notes_table.setStyle(TableStyle([
-                    ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-                    ('FONTSIZE', (0, 0), (-1, -1), 9),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                    ('PADDING', (0, 0), (-1, -1), 8)
-                ]))
-                story.append(notes_table)
-                story.append(Spacer(1, 15))
-            
-            # Completion Verification Section
-            story.append(Paragraph("COMPLETION VERIFICATION", header_style))
-            
-            verification_data = [
-                ["Completed By:", str(pm_data.get('technician_name', '')), 
-                 "Completion Date:", str(pm_data.get('completion_date', ''))],
-                ["Total Time Spent:", f"{total_labor_time:.1f} hours", 
-                 "Form Generated:", datetime.now().strftime('%Y-%m-%d %H:%M:%S')],
-                ["Data Entry Status:", "AUTOMATICALLY ENTERED INTO CMMS", 
-                 "Next PM Scheduled:", str(pm_data.get('next_annual_pm_date', 'As per schedule'))],
-                ["Document Reference:", f"PM_Completion_{pm_completion_id}", 
-                 "Form Status:", "OFFICIAL COMPLETION RECORD"]
-            ]
-            
-            verification_table = Table(verification_data, colWidths=[1.5*inch, 2*inch, 1.5*inch, 2*inch])
-            verification_table.setStyle(TableStyle([
-                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 0), (-1, -1), 9),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('BACKGROUND', (0, 0), (0, -1), colors.lightblue),
-                ('BACKGROUND', (2, 0), (2, -1), colors.lightblue),
-                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                ('PADDING', (0, 0), (-1, -1), 4)
-            ]))
-            
-            story.append(verification_table)
-            story.append(Spacer(1, 20))
-            
-            # Footer
-            footer_text = f"""
-            This PM completion form was automatically generated by the AIT CMMS system upon successful 
-            completion of the preventive maintenance task. This document serves as an official record 
-            of the completed work and has been automatically archived in the system database.
-            
-            Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 
-            System: AIT CMMS v2.0 | 
-            Document ID: PM_COMP_{pm_completion_id}
-            """
-            
-            story.append(Paragraph(footer_text, styles['Normal']))
-            
-            # Build PDF
-            doc.build(story)
-            return True
-            
-        except Exception as e:
-            print(f"Error creating PM completion form PDF: {e}")
-            return False
-
-    def create_completion_forms_tab(self):
-        """Create tab for managing PM completion forms"""
-        self.completion_forms_frame = ttk.Frame(self.cmms.notebook)
-        self.cmms.notebook.add(self.completion_forms_frame, text="PM Completion Forms")
-        
-        # Controls
-        controls_frame = ttk.LabelFrame(self.completion_forms_frame, text="PM Completion Forms Management", padding=10)
-        controls_frame.pack(fill='x', padx=10, pady=5)
-        
-        ttk.Button(controls_frame, text="Refresh Forms List", 
-                  command=self.load_completion_forms).pack(side='left', padx=5)
-        ttk.Button(controls_frame, text="Open Selected Form", 
-                  command=self.open_selected_form).pack(side='left', padx=5)
-        ttk.Button(controls_frame, text="Export Selected Forms", 
-                  command=self.export_selected_forms).pack(side='left', padx=5)
-        ttk.Button(controls_frame, text="Open Forms Directory", 
-                  command=self.open_forms_directory).pack(side='left', padx=5)
-        ttk.Button(controls_frame, text="Generate Missing Forms", 
-                  command=self.generate_missing_forms_dialog).pack(side='left', padx=5)
-        
-        # Search frame
-        search_frame = ttk.Frame(self.completion_forms_frame)
-        search_frame.pack(fill='x', padx=10, pady=5)
-        
-        ttk.Label(search_frame, text="Search Forms:").pack(side='left', padx=5)
-        self.forms_search_var = tk.StringVar()
-        self.forms_search_var.trace('w', self.filter_completion_forms)
-        search_entry = ttk.Entry(search_frame, textvariable=self.forms_search_var, width=30)
-        search_entry.pack(side='left', padx=5)
-        
-        ttk.Button(search_frame, text="Clear", 
-                  command=lambda: self.forms_search_var.set('')).pack(side='left', padx=5)
-        
-        # Forms list
-        list_frame = ttk.LabelFrame(self.completion_forms_frame, text="Generated PM Completion Forms", padding=10)
-        list_frame.pack(fill='both', expand=True, padx=10, pady=5)
-        
-        self.completion_forms_tree = ttk.Treeview(list_frame,
-                                                columns=('Equipment', 'PM Type', 'Technician', 'Completion Date', 
-                                                        'Generated Date', 'Filename', 'Status'),
-                                                show='headings')
-        
-        forms_columns = {
-            'Equipment': ('Equipment', 120),
-            'PM Type': ('PM Type', 100),
-            'Technician': ('Technician', 120),
-            'Completion Date': ('Completion Date', 120),
-            'Generated Date': ('Generated Date', 120),
-            'Filename': ('Form Filename', 200),
-            'Status': ('Status', 80)
-        }
-        
-        for col, (heading, width) in forms_columns.items():
-            self.completion_forms_tree.heading(col, text=heading)
-            self.completion_forms_tree.column(col, width=width)
-        
-        # Scrollbars
-        forms_v_scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.completion_forms_tree.yview)
-        forms_h_scrollbar = ttk.Scrollbar(list_frame, orient='horizontal', command=self.completion_forms_tree.xview)
-        self.completion_forms_tree.configure(yscrollcommand=forms_v_scrollbar.set, xscrollcommand=forms_h_scrollbar.set)
-        
-        # Pack treeview and scrollbars
-        self.completion_forms_tree.grid(row=0, column=0, sticky='nsew')
-        forms_v_scrollbar.grid(row=0, column=1, sticky='ns')
-        forms_h_scrollbar.grid(row=1, column=0, sticky='ew')
-        
-        list_frame.grid_rowconfigure(0, weight=1)
-        list_frame.grid_columnconfigure(0, weight=1)
-        
-        # Load initial data
-        self.load_completion_forms()
-
-    def load_completion_forms(self):
-        """Load completion forms from database"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT bfm_equipment_no, pm_type, technician_name, completion_date, 
-                       generated_date, form_filename, form_status, form_path
-                FROM pm_completion_forms
-                ORDER BY generated_date DESC
-            ''')
-            
-            # Clear existing items
-            for item in self.completion_forms_tree.get_children():
-                self.completion_forms_tree.delete(item)
-            
-            # Add forms
-            for form in cursor.fetchall():
-                equipment, pm_type, technician, comp_date, gen_date, filename, status, form_path = form
-                
-                # Check if file still exists
-                if not os.path.exists(form_path):
-                    status = "Missing"
-                
-                self.completion_forms_tree.insert('', 'end', values=(
-                    equipment, pm_type, technician, comp_date, 
-                    gen_date[:10], filename, status  # Show only date part
-                ))
-            
-        except Exception as e:
-            print(f"Error loading completion forms: {e}")
-
-    def filter_completion_forms(self, *args):
-        """Filter completion forms based on search term"""
-        search_term = self.forms_search_var.get().lower()
-        
-        try:
-            cursor = self.conn.cursor()
-            if search_term:
-                cursor.execute('''
-                    SELECT bfm_equipment_no, pm_type, technician_name, completion_date, 
-                           generated_date, form_filename, form_status, form_path
-                    FROM pm_completion_forms
-                    WHERE LOWER(bfm_equipment_no) LIKE ? 
-                    OR LOWER(technician_name) LIKE ?
-                    OR LOWER(pm_type) LIKE ?
-                    ORDER BY generated_date DESC
-                ''', (f'%{search_term}%', f'%{search_term}%', f'%{search_term}%'))
-            else:
-                cursor.execute('''
-                    SELECT bfm_equipment_no, pm_type, technician_name, completion_date, 
-                           generated_date, form_filename, form_status, form_path
-                    FROM pm_completion_forms
-                    ORDER BY generated_date DESC
-                ''')
-            
-            # Clear and repopulate
-            for item in self.completion_forms_tree.get_children():
-                self.completion_forms_tree.delete(item)
-            
-            for form in cursor.fetchall():
-                equipment, pm_type, technician, comp_date, gen_date, filename, status, form_path = form
-                
-                # Check if file still exists
-                if not os.path.exists(form_path):
-                    status = "Missing"
-                
-                self.completion_forms_tree.insert('', 'end', values=(
-                    equipment, pm_type, technician, comp_date, 
-                    gen_date[:10], filename, status
-                ))
-        
-        except Exception as e:
-            print(f"Error filtering forms: {e}")
-
-    def open_selected_form(self):
-        """Open selected PM completion form"""
-        selected = self.completion_forms_tree.selection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please select a form to open")
-            return
-        
-        try:
-            item = self.completion_forms_tree.item(selected[0])
-            filename = item['values'][5]  # Form filename
-            
-            # Find the form path
-            cursor = self.conn.cursor()
-            cursor.execute('SELECT form_path FROM pm_completion_forms WHERE form_filename = ?', (filename,))
-            result = cursor.fetchone()
-            
-            if result and os.path.exists(result[0]):
-                self._open_file(result[0])
-            else:
-                messagebox.showerror("Error", "Form file not found")
-                
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to open form: {str(e)}")
-
-    def _open_file(self, file_path):
-        """Cross-platform file opener"""
-        try:
-            if sys.platform.startswith('win'):
-                os.startfile(file_path)
-            elif sys.platform.startswith('darwin'):  # macOS
-                subprocess.call(['open', file_path])
-            else:  # Linux and other Unix-like systems
-                subprocess.call(['xdg-open', file_path])
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to open file: {str(e)}")
-
-    def export_selected_forms(self):
-        """Export selected forms to a chosen directory"""
-        selected = self.completion_forms_tree.selection()
-        if not selected:
-            messagebox.showwarning("Warning", "Please select forms to export")
-            return
-        
-        # Choose export directory
-        export_dir = filedialog.askdirectory(title="Choose Export Directory")
-        if not export_dir:
-            return
-        
-        try:
-            exported_count = 0
-            for item_id in selected:
-                item = self.completion_forms_tree.item(item_id)
-                filename = item['values'][5]
-                
-                # Find source path
-                cursor = self.conn.cursor()
-                cursor.execute('SELECT form_path FROM pm_completion_forms WHERE form_filename = ?', (filename,))
-                result = cursor.fetchone()
-                
-                if result and os.path.exists(result[0]):
-                    dest_path = os.path.join(export_dir, filename)
-                    shutil.copy2(result[0], dest_path)
-                    exported_count += 1
-            
-            messagebox.showinfo("Success", f"Exported {exported_count} forms to {export_dir}")
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to export forms: {str(e)}")
-
-    def open_forms_directory(self):
-        """Open the forms directory in file explorer"""
-        try:
-            self._open_file(self.forms_directory)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to open directory: {str(e)}")
-
-    def generate_missing_forms_dialog(self):
-        """Dialog to generate forms for completed PMs that don't have forms yet"""
-        try:
-            cursor = self.conn.cursor()
-            
-            # Find PM completions without forms
-            cursor.execute('''
-                SELECT pc.id, pc.bfm_equipment_no, pc.pm_type, pc.technician_name, 
-                       pc.completion_date
-                FROM pm_completions pc
-                LEFT JOIN pm_completion_forms pcf ON pc.id = pcf.pm_completion_id
-                WHERE pcf.pm_completion_id IS NULL
-                ORDER BY pc.completion_date DESC
-                LIMIT 50
-            ''')
-            
-            missing_forms = cursor.fetchall()
-            
-            if not missing_forms:
-                messagebox.showinfo("No Missing Forms", "All completed PMs have forms generated")
-                return
-            
-            # Create dialog
-            dialog = tk.Toplevel(self.root)
-            dialog.title("Generate Missing PM Completion Forms")
-            dialog.geometry("700x500")
-            dialog.transient(self.root)
-            dialog.grab_set()
-            
-            # Instructions
-            instructions = ttk.Label(dialog, 
-                                   text=f"Found {len(missing_forms)} completed PMs without forms. Select which to generate:",
-                                   font=('Arial', 10, 'bold'))
-            instructions.pack(pady=10)
-            
-            # List of missing forms
-            list_frame = ttk.Frame(dialog)
-            list_frame.pack(fill='both', expand=True, padx=10, pady=10)
-            
-            missing_tree = ttk.Treeview(list_frame,
-                                      columns=('Equipment', 'PM Type', 'Technician', 'Completion Date'),
-                                      show='headings')
-            
-            for col in ('Equipment', 'PM Type', 'Technician', 'Completion Date'):
-                missing_tree.heading(col, text=col)
-                missing_tree.column(col, width=150)
-            
-            # Add scrollbar to missing forms tree
-            missing_scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=missing_tree.yview)
-            missing_tree.configure(yscrollcommand=missing_scrollbar.set)
-            
-            missing_tree.pack(side='left', fill='both', expand=True)
-            missing_scrollbar.pack(side='right', fill='y')
-            
-            # Populate missing forms list
-            for form_data in missing_forms:
-                pm_id, equipment, pm_type, technician, comp_date = form_data
-                missing_tree.insert('', 'end', values=(equipment, pm_type, technician, comp_date))
-            
-            # Select all checkbox
-            select_frame = ttk.Frame(dialog)
-            select_frame.pack(fill='x', padx=10, pady=5)
-            
-            select_all_var = tk.BooleanVar()
-            select_all_cb = ttk.Checkbutton(select_frame, text="Select All", variable=select_all_var,
-                                          command=lambda: self._toggle_all_missing_forms(missing_tree, select_all_var.get()))
-            select_all_cb.pack(side='left')
-            
-            # Progress frame (initially hidden)
-            progress_frame = ttk.Frame(dialog)
-            progress_label = ttk.Label(progress_frame, text="Generating forms...")
-            progress_bar = ttk.Progressbar(progress_frame, mode='determinate')
-            
-            # Buttons
-            button_frame = ttk.Frame(dialog)
-            button_frame.pack(fill='x', padx=10, pady=10)
-            
-            def generate_selected_forms():
-                selected_items = missing_tree.selection()
-                if not selected_items:
-                    messagebox.showwarning("Warning", "Please select forms to generate")
-                    return
-                
-                # Show progress
-                progress_frame.pack(fill='x', padx=10, pady=5)
-                progress_label.pack()
-                progress_bar.pack(fill='x', pady=5)
-                progress_bar['maximum'] = len(selected_items)
-                
-                # Disable buttons during generation
-                for widget in button_frame.winfo_children():
-                    widget.configure(state='disabled')
-                
-                generated_count = 0
-                failed_count = 0
-                
-                for i, item_id in enumerate(selected_items):
-                    item_values = missing_tree.item(item_id)['values']
-                    equipment, pm_type, technician, comp_date = item_values
-                    
-                    # Find the corresponding PM completion data
-                    pm_data_cursor = self.conn.cursor()
-                    pm_data_cursor.execute('''
-                        SELECT id, bfm_equipment_no, pm_type, technician_name, completion_date,
-                               labor_hours, labor_minutes, special_equipment, notes,
-                               next_annual_pm_date, pm_due_date
-                        FROM pm_completions
-                        WHERE bfm_equipment_no = ? AND pm_type = ? AND technician_name = ? AND completion_date = ?
-                    ''', (equipment, pm_type, technician, comp_date))
-                    
-                    pm_record = pm_data_cursor.fetchone()
-                    if pm_record:
-                        pm_id, bfm_no, pm_type, tech_name, comp_date, labor_hrs, labor_mins, special_eq, notes, next_pm, due_date = pm_record
-                        
-                        # Create PM data dictionary
-                        pm_completion_data = {
-                            'bfm_equipment_no': bfm_no,
-                            'pm_type': pm_type,
-                            'technician_name': tech_name,
-                            'completion_date': comp_date,
-                            'labor_hours': labor_hrs or 0,
-                            'labor_minutes': labor_mins or 0,
-                            'special_equipment': special_eq or '',
-                            'notes': notes or '',
-                            'next_annual_pm_date': next_pm or '',
-                            'pm_due_date': due_date or ''
-                        }
-                        
-                        # Generate the form
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        form_filename = f"PM_Completion_{bfm_no}_{pm_type}_{comp_date}_{timestamp}.pdf"
-                        form_path = os.path.join(self.forms_directory, form_filename)
-                        
-                        success = self.create_pm_completion_form_pdf(form_path, pm_completion_data, pm_id)
-                        
-                        if success:
-                            # Record in database
-                            form_cursor = self.conn.cursor()
-                            form_cursor.execute('''
-                                INSERT INTO pm_completion_forms 
-                                (pm_completion_id, bfm_equipment_no, pm_type, technician_name, 
-                                 completion_date, form_filename, form_path)
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
-                            ''', (pm_id, bfm_no, pm_type, tech_name, comp_date, form_filename, form_path))
-                            self.conn.commit()
-                            generated_count += 1
-                        else:
-                            failed_count += 1
-                    else:
-                        failed_count += 1
-                    
-                    # Update progress
-                    progress_bar['value'] = i + 1
-                    progress_label.configure(text=f"Generating forms... {i + 1}/{len(selected_items)}")
-                    dialog.update()
-                
-                # Hide progress and show results
-                progress_frame.pack_forget()
-                
-                # Re-enable buttons
-                for widget in button_frame.winfo_children():
-                    widget.configure(state='normal')
-                
-                # Show results
-                result_msg = f"Generated {generated_count} forms successfully"
-                if failed_count > 0:
-                    result_msg += f"\n{failed_count} forms failed to generate"
-                
-                messagebox.showinfo("Generation Complete", result_msg)
-                
-                # Refresh the main forms list
-                self.load_completion_forms()
-                
-                dialog.destroy()
-            
-            def close_dialog():
-                dialog.destroy()
-            
-            ttk.Button(button_frame, text="Generate Selected Forms", 
-                      command=generate_selected_forms).pack(side='left', padx=5)
-            ttk.Button(button_frame, text="Cancel", 
-                      command=close_dialog).pack(side='right', padx=5)
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load missing forms: {str(e)}")
-
-    def _toggle_all_missing_forms(self, tree, select_all):
-        """Toggle selection of all items in missing forms tree"""
-        if select_all:
-            # Select all items
-            for item in tree.get_children():
-                tree.selection_add(item)
-        else:
-            # Deselect all items
-            tree.selection_remove(tree.selection())
-
-    def get_pm_completion_stats(self):
-        """Get statistics about PM completion forms"""
-        try:
-            cursor = self.conn.cursor()
-            
-            # Total completed PMs
-            cursor.execute('SELECT COUNT(*) FROM pm_completions')
-            total_completed = cursor.fetchone()[0]
-            
-            # Total forms generated
-            cursor.execute('SELECT COUNT(*) FROM pm_completion_forms')
-            total_forms = cursor.fetchone()[0]
-            
-            # Missing forms
-            cursor.execute('''
-                SELECT COUNT(*) FROM pm_completions pc
-                LEFT JOIN pm_completion_forms pcf ON pc.id = pcf.pm_completion_id
-                WHERE pcf.pm_completion_id IS NULL
-            ''')
-            missing_forms = cursor.fetchone()[0]
-            
-            # Forms by status
-            cursor.execute('''
-                SELECT form_status, COUNT(*) FROM pm_completion_forms
-                GROUP BY form_status
-            ''')
-            status_counts = dict(cursor.fetchall())
-            
-            return {
-                'total_completed': total_completed,
-                'total_forms': total_forms,
-                'missing_forms': missing_forms,
-                'status_counts': status_counts
-            }
-            
-        except Exception as e:
-            print(f"Error getting PM completion stats: {e}")
-            return None
-
-    def show_completion_forms_statistics(self):
-        """Show statistics dialog for PM completion forms"""
-        stats = self.get_pm_completion_stats()
-        if not stats:
-            messagebox.showerror("Error", "Failed to load statistics")
-            return
-        
-        # Create statistics dialog
-        stats_dialog = tk.Toplevel(self.root)
-        stats_dialog.title("PM Completion Forms Statistics")
-        stats_dialog.geometry("400x300")
-        stats_dialog.transient(self.root)
-        stats_dialog.grab_set()
-        
-        # Title
-        title_label = ttk.Label(stats_dialog, text="PM Completion Forms Statistics", 
-                               font=('Arial', 14, 'bold'))
-        title_label.pack(pady=10)
-        
-        # Statistics frame
-        stats_frame = ttk.LabelFrame(stats_dialog, text="Overview", padding=10)
-        stats_frame.pack(fill='x', padx=10, pady=5)
-        
-        ttk.Label(stats_frame, text=f"Total Completed PMs: {stats['total_completed']}").pack(anchor='w')
-        ttk.Label(stats_frame, text=f"Total Forms Generated: {stats['total_forms']}").pack(anchor='w')
-        ttk.Label(stats_frame, text=f"Missing Forms: {stats['missing_forms']}").pack(anchor='w')
-        
-        # Calculate completion percentage
-        if stats['total_completed'] > 0:
-            completion_pct = (stats['total_forms'] / stats['total_completed']) * 100
-            ttk.Label(stats_frame, text=f"Form Completion Rate: {completion_pct:.1f}%").pack(anchor='w')
-        
-        # Status breakdown
-        if stats['status_counts']:
-            status_frame = ttk.LabelFrame(stats_dialog, text="Forms by Status", padding=10)
-            status_frame.pack(fill='x', padx=10, pady=5)
-            
-            for status, count in stats['status_counts'].items():
-                ttk.Label(status_frame, text=f"{status}: {count}").pack(anchor='w')
-        
-        # Close button
-        ttk.Button(stats_dialog, text="Close", 
-                  command=stats_dialog.destroy).pack(pady=10)
-
-    def cleanup_missing_form_records(self):
-        """Clean up database records for forms that no longer exist"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('SELECT id, form_path FROM pm_completion_forms')
-            
-            removed_count = 0
-            for form_id, form_path in cursor.fetchall():
-                if not os.path.exists(form_path):
-                    cursor.execute('DELETE FROM pm_completion_forms WHERE id = ?', (form_id,))
-                    removed_count += 1
-            
-            self.conn.commit()
-            
-            if removed_count > 0:
-                messagebox.showinfo("Cleanup Complete", 
-                                   f"Removed {removed_count} records for missing form files")
-                self.load_completion_forms()  # Refresh the list
-            else:
-                messagebox.showinfo("Cleanup Complete", "No missing form records found")
-                
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to cleanup records: {str(e)}")
-
-    def add_forms_management_menu(self):
-        """Add forms management options to the main menu"""
-        if hasattr(self.cmms, 'menubar'):
-            # Add Forms menu
-            forms_menu = tk.Menu(self.cmms.menubar, tearoff=0)
-            self.cmms.menubar.add_cascade(label="Forms", menu=forms_menu)
-            
-            forms_menu.add_command(label="Show Forms Statistics", 
-                                 command=self.show_completion_forms_statistics)
-            forms_menu.add_command(label="Generate Missing Forms", 
-                                 command=self.generate_missing_forms_dialog)
-            forms_menu.add_command(label="Open Forms Directory", 
-                                 command=self.open_forms_directory)
-            forms_menu.add_separator()
-            forms_menu.add_command(label="Cleanup Missing Records", 
-                                 command=self.cleanup_missing_form_records)
-
-# Integration helper function for the main CMMS system
-def integrate_pm_completion_forms(cmms_system):
-    """
-    Integration function to add PM completion forms functionality to existing CMMS
-    Call this from the main CMMS __init__ method
-    """
-    try:
-        # Create the forms manager
-        cmms_system.pm_forms_manager = PMCompletionFormsManager(cmms_system)
-        
-        # Add the forms tab
-        cmms_system.pm_forms_manager.create_completion_forms_tab()
-        
-        # Add menu items if menubar exists
-        cmms_system.pm_forms_manager.add_forms_management_menu()
-        
-        print("PM Completion Forms module integrated successfully")
-        return True
-        
-    except Exception as e:
-        print(f"Error integrating PM Completion Forms: {e}")
-        return False
-
-# Example usage for automatic form generation when PM is completed
-def example_pm_completion_with_form_generation(cmms_system, pm_completion_data):
-    """
-    Example of how to integrate automatic form generation with PM completion
-    Call this from your existing submit_pm_completion method
-    """
-    try:
-        # First, save the PM completion to database (your existing code)
-        # ... existing PM completion logic ...
-        
-        # Then automatically generate the completion form
-        if hasattr(cmms_system, 'pm_forms_manager'):
-            form_path = cmms_system.pm_forms_manager.auto_generate_completion_form_on_pm_submit(pm_completion_data)
-            
-            if form_path:
-                print(f"PM completion form automatically generated: {form_path}")
-                # Optionally show success message to user
-                messagebox.showinfo("Form Generated", 
-                                   f"PM completion form has been automatically generated and saved to:\n{form_path}")
-            else:
-                print("Warning: PM completion form generation failed")
-        
-        return True
-        
-    except Exception as e:
-        print(f"Error in PM completion with form generation: {e}")
-        return False
-
-
-
-
-
-
-
-
-class ModernCMMSStyles:
-    """Modern styling constants for the CMMS application"""
-    
-    # Color palette
-    PRIMARY = "#2E86AB"      # Blue
-    SECONDARY = "#A23B72"    # Purple
-    SUCCESS = "#4CAF50"      # Green
-    WARNING = "#FF9800"      # Orange
-    DANGER = "#F44336"       # Red
-    INFO = "#2196F3"         # Light Blue
-    LIGHT = "#F5F5F5"        # Light Gray
-    DARK = "#37474F"         # Dark Gray
-    WHITE = "#FFFFFF"
-    
-    # Status colors
-    ACTIVE_COLOR = "#4CAF50"      # Green
-    MISSING_COLOR = "#FFC107"     # Yellow
-    RTF_COLOR = "#FF9800"         # Orange
-    COMPLETED_COLOR = "#2196F3"   # Blue
-    SCHEDULED_COLOR = "#FFC107"   # Amber
-    
-    # Fonts
-    HEADER_FONT = ("Segoe UI", 14, "bold")
-    SUBHEADER_FONT = ("Segoe UI", 12, "bold")
-    BODY_FONT = ("Segoe UI", 10)
-    SMALL_FONT = ("Segoe UI", 9)
-    
-    # Styling
-    BORDER_RADIUS = 8
-    PADDING = 10
-    LARGE_PADDING = 20
-
-
-class ModernTreeview(ttk.Treeview):
-    """Enhanced Treeview with modern styling and color coding"""
-    
-    def __init__(self, parent, columns=None, show='headings', height=None, **kwargs):
-        super().__init__(parent, columns=columns, show=show, height=height, **kwargs)
-        
-        # Configure modern styling
-        self.configure_modern_style()
-        
-        # Store color mappings
-        self.color_mappings = {}
-        
-    def configure_modern_style(self):
-        """Apply modern styling to the treeview"""
-        style = ttk.Style()
-        
-        # Configure treeview style
-        style.configure("Modern.Treeview",
-                       background="white",
-                       foreground=ModernCMMSStyles.DARK,
-                       fieldbackground="white",
-                       font=ModernCMMSStyles.BODY_FONT,
-                       rowheight=25,  # Make rows slightly taller for better grid visibility
-                       relief="solid")  # Add border relief
-                       
-        # Configure grid lines
-        style.map("Modern.Treeview",
-                background=[('selected', ModernCMMSStyles.INFO)],
-                relief=[('!focus', 'solid')])
-        
-        style.configure("Modern.Treeview.Heading",
-                       background=ModernCMMSStyles.PRIMARY,
-                       foreground="white",
-                       font=ModernCMMSStyles.SUBHEADER_FONT,
-                       relief="flat")
-        
-        # Configure selection colors
-        style.map("Modern.Treeview",
-                 background=[('selected', ModernCMMSStyles.INFO)])
-        
-        self.configure(style="Modern.Treeview")
-        
-    def insert_with_color(self, parent, index, values=None, tags=None, **kwargs):
-        """Insert item with automatic color coding based on status"""
-        if values and len(values) > 0:
-            # Determine color based on status (assuming last column or specific position)
-            # For CM tree, status is at index 5 (0-indexed: CM Number, Equipment, Description, Priority, Assigned, Status, ...)
-            if len(values) > 5:  # CM format
-                status = str(values[5]).upper() if values[5] else "UNKNOWN"
-            else:  # Other formats (PM, equipment, etc.)
-                status = str(values[-1]).upper() if values else "UNKNOWN"
-        
-            # Create tag for this status
-            tag = f"status_{status.lower().replace(' ', '_')}"
-        
-            # Configure tag colors for CM statuses
-            if status == "COMPLETED":
-                self.tag_configure(tag, background="#E8F5E8", foreground="#2E7D32")  # Light green bg, dark green text
-            elif status == "IN PROGRESS":
-                self.tag_configure(tag, background="#FFF3E0", foreground="#F57C00")  # Light orange bg, orange text  
-            elif status == "OPEN":
-                self.tag_configure(tag, background="#FFEBEE", foreground="#C62828")  # Light red bg, red text
-            elif status == "CANCELLED":
-                self.tag_configure(tag, background="#F3E5F5", foreground="#7B1FA2")  # Light purple bg, purple text
-            # Equipment/PM statuses (existing)
-            elif status == "ACTIVE":
-                self.tag_configure(tag, background="#E8F5E8", foreground=ModernCMMSStyles.SUCCESS)
-            elif status == "MISSING":
-                self.tag_configure(tag, background="#FFF8E1", foreground="#F57C00")
-            elif status == "RUN TO FAILURE":
-                self.tag_configure(tag, background="#FFF3E0", foreground=ModernCMMSStyles.WARNING)
-            elif status == "SCHEDULED":
-                self.tag_configure(tag, background="#FFFDE7", foreground="#F57F17")
-            else:
-                self.tag_configure(tag, background="white", foreground=ModernCMMSStyles.DARK)
-        
-            # Add the tag to existing tags
-            if tags:
-                if isinstance(tags, (list, tuple)):
-                    tags = list(tags) + [tag]
-                else:
-                    tags = [tags, tag]
-            else:
-                tags = [tag]
-    
-        return super().insert(parent, index, values=values, tags=tags, **kwargs)
-
-
-class ModernFrame(ttk.Frame):
-    """Enhanced frame with modern styling"""
-    
-    def __init__(self, parent, title=None, **kwargs):
-        super().__init__(parent, **kwargs)
-        
-        if title:
-            self.create_titled_frame(title)
-            
-    def create_titled_frame(self, title):
-        """Create a frame with a modern title"""
-        # Title frame
-        title_frame = ttk.Frame(self)
-        title_frame.pack(fill='x', pady=(0, 10))
-        
-        # Title label
-        title_label = ttk.Label(title_frame, 
-                               text=title, 
-                               font=ModernCMMSStyles.HEADER_FONT,
-                               foreground=ModernCMMSStyles.PRIMARY)
-        title_label.pack(side='left')
-        
-        # Separator line
-        separator = ttk.Separator(title_frame, orient='horizontal')
-        separator.pack(fill='x', padx=(10, 0), pady=(8, 0))
-
-
-class StatusCard(ttk.Frame):
-    """Modern status card widget"""
-    
-    def __init__(self, parent, title, value, color=None, **kwargs):
-        super().__init__(parent, **kwargs)
-        
-        self.title = title
-        self.value = value
-        self.color = color or ModernCMMSStyles.PRIMARY
-        
-        self.create_card()
-        
-    def create_card(self):
-        """Create the status card layout"""
-        # Card frame with styling
-        card_frame = ttk.LabelFrame(self, text="", padding=15)
-        card_frame.pack(fill='both', expand=True, padx=5, pady=5)
-        
-        # Value label (large)
-        value_label = ttk.Label(card_frame, 
-                               text=str(self.value),
-                               font=("Segoe UI", 24, "bold"),
-                               foreground=self.color)
-        value_label.pack()
-        
-        # Title label
-        title_label = ttk.Label(card_frame,
-                               text=self.title,
-                               font=ModernCMMSStyles.BODY_FONT,
-                               foreground=ModernCMMSStyles.DARK)
-        title_label.pack()
-        
-    def update_value(self, new_value):
-        """Update the card value"""
-        self.value = new_value
-        # Find and update the value label
-        for child in self.winfo_children():
-            if isinstance(child, ttk.LabelFrame):
-                for label in child.winfo_children():
-                    if isinstance(label, ttk.Label):
-                        # Check if this is the value label (the large number)
-                        font_config = str(label.cget('font'))
-                        if '24' in font_config:  # This is the value label
-                            label.config(text=str(new_value))
-                            break
-
-
-
-
-
-
 
 
 class DateStandardizer:
@@ -1369,775 +183,493 @@ class DateStandardizer:
 
 
 class AITCMMSSystem:
+    """Complete AIT CMMS - Computerized Maintenance Management System"""
     
-    def export_filtered_cm_to_pdf(self):
-        """Export filtered CM results to PDF"""
-        try:
-            # Get current filter values
-            search_term = self.cm_search_var.get().lower()
-            status_filter = self.cm_status_filter_var.get()
-        
-            # Build filename based on search criteria
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            if search_term:
-                filename = f"CM_Export_{search_term.replace(' ', '_')}_{timestamp}.pdf"
-            elif status_filter != "All":
-                filename = f"CM_Export_{status_filter}_{timestamp}.pdf"
-            else:
-                filename = f"CM_Export_All_{timestamp}.pdf"
-        
-            # Get filtered data using the same logic as your filter method
-            cursor = self.conn.cursor()
-        
-            # Build the query with same filters as filter_cm_list
-            base_query = '''
-                SELECT cm_number, bfm_equipment_no, description, priority, 
-                    assigned_technician, status, created_date, completion_date, 
-                    labor_hours, notes, root_cause, corrective_action
-                FROM corrective_maintenance
-            '''
-        
-            conditions = []
-            params = []
-        
-            # Add search filter
-            if search_term:
-                conditions.append('''
-                    (LOWER(cm_number) LIKE ? OR 
-                     LOWER(bfm_equipment_no) LIKE ? OR 
-                     LOWER(description) LIKE ? OR 
-                     LOWER(assigned_technician) LIKE ?)
-                ''')
-                search_param = f'%{search_term}%'
-                params.extend([search_param, search_param, search_param, search_param])
-        
-            # Add status filter
-            if status_filter != "All":
-                conditions.append('status = ?')
-                params.append(status_filter)
-        
-            # Combine conditions
-            if conditions:
-                query = base_query + ' WHERE ' + ' AND '.join(conditions)
-            else:
-                query = base_query
-        
-            query += ' ORDER BY created_date DESC'
-        
-            cursor.execute(query, params)
-            filtered_cms = cursor.fetchall()
-        
-            if not filtered_cms:
-                messagebox.showwarning("No Data", "No CM records match your current filters.")
-                return
-        
-            # Create PDF
-            self.create_cm_export_pdf(filename, filtered_cms, search_term, status_filter)
-        
-        except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export CM data: {str(e)}")
-
-    def create_cm_export_pdf(self, filename, cm_data, search_term, status_filter):
-        """Create PDF report of CM data"""
-        try:
-            # Create PDF document
-            doc = SimpleDocTemplate(filename, pagesize=letter,
-                                rightMargin=36, leftMargin=36,
-                                topMargin=36, bottomMargin=36)
-    
-            story = []
-            styles = getSampleStyleSheet()
-    
-            # Custom styles
-            title_style = ParagraphStyle('TitleStyle', parent=styles['Title'], 
-                                    fontSize=16, textColor=colors.darkblue, alignment=1)
-        
-            cell_style = ParagraphStyle(
-                'CellStyle',
-                parent=styles['Normal'],
-                fontSize=8,
-                leading=10,
-                wordWrap='LTR'
-            )
-    
-            header_cell_style = ParagraphStyle(
-                'HeaderCellStyle',
-                parent=styles['Normal'],
-                fontSize=9,
-                fontName='Helvetica-Bold',
-                leading=11,
-                wordWrap='LTR'
-            )
-    
-            # Header
-            story.append(Paragraph("AIT CMMS - CORRECTIVE MAINTENANCE REPORT", title_style))
-            story.append(Spacer(1, 20))
-        
-            # Report info
-            story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
-        
-            # Filter information
-            filter_info = "Filters Applied: "
-            if search_term:
-                filter_info += f"Search: '{search_term}' "
-            if status_filter != "All":
-                filter_info += f"Status: {status_filter} "
-            if not search_term and status_filter == "All":
-                filter_info += "None (All Records)"
-    
-            story.append(Paragraph(filter_info, styles['Normal']))
-            story.append(Paragraph(f"Total Records: {len(cm_data)}", styles['Normal']))
-            story.append(Spacer(1, 20))
-    
-            # Create table data with Paragraph objects for better text wrapping
-            table_data = [
-                [
-                    Paragraph('CM Number', header_cell_style),
-                    Paragraph('Equipment', header_cell_style), 
-                    Paragraph('Description', header_cell_style),
-                    Paragraph('Priority', header_cell_style),
-                    Paragraph('Assigned To', header_cell_style),
-                    Paragraph('Status', header_cell_style),
-                    Paragraph('Created Date', header_cell_style),
-                    Paragraph('Completed Date', header_cell_style),
-                    Paragraph('Root Cause', header_cell_style),
-                    Paragraph('Corrective Action', header_cell_style)
-                ]
-            ]
-
-            # Add CM data with proper text wrapping
-            for cm in cm_data:
-                cm_number, equipment, description, priority, assigned, status, created_date, completion_date, labor_hours, notes, root_cause, corrective_action = cm[:12]
-        
-                table_data.append([
-                    Paragraph(str(cm_number) if cm_number else '', cell_style),
-                    Paragraph(str(equipment) if equipment else '', cell_style),
-                    Paragraph(str(description) if description else '', cell_style),
-                    Paragraph(str(priority) if priority else '', cell_style),
-                    Paragraph(str(assigned) if assigned else '', cell_style),
-                    Paragraph(str(status) if status else '', cell_style),
-                    Paragraph(str(created_date) if created_date else '', cell_style),
-                    Paragraph(str(completion_date) if completion_date else '', cell_style),
-                    Paragraph(str(root_cause) if root_cause else '', cell_style),  # NEW DATA
-                    Paragraph(str(corrective_action) if corrective_action else '', cell_style)
-                ])
-
-            # Create table with PROPERLY SIZED column widths for letter page
-            # Total available width is about 7.5 inches (540 points)
-            table = Table(table_data, colWidths=[
-                0.7*inch,   # CM Number (reduced)
-                0.7*inch,   # Equipment (reduced)
-                1.5*inch,   # Description (reduced)
-                0.5*inch,   # Priority (reduced)
-                0.8*inch,   # Assigned To (reduced)
-                0.6*inch,   # Status (reduced)
-                0.7*inch,   # Created Date (reduced)
-                0.7*inch,   # Completed Date (reduced)
-                1.0*inch,   # Root Cause (NEW)
-                1.0*inch    # Corrective Action (NEW)
-            ])  # Total: ~7.5 inches (fits within margins)
-        
-            table.setStyle(TableStyle([
-                # Header row styling
-                ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 9),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                
-                # Data rows styling
-                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
-                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 1), (-1, -1), 8),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                ('LEFTPADDING', (0, 0), (-1, -1), 3),
-                ('RIGHTPADDING', (0, 0), (-1, -1), 3),
-                ('TOPPADDING', (0, 0), (-1, -1), 2),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 2)
-            ]))
-    
-            story.append(table)
-    
-            # Add summary statistics
-            if len(cm_data) > 0:
-                story.append(Spacer(1, 20))
-                story.append(Paragraph("SUMMARY STATISTICS", styles['Heading2']))
-    
-                # Status breakdown
-                status_counts = {}
-                priority_counts = {}
-                technician_counts = {}
-    
-                for cm in cm_data:
-                    status = cm[5] or 'Unknown'
-                    priority = cm[3] or 'Unknown'
-                    technician = cm[4] or 'Unassigned'
-            
-                    status_counts[status] = status_counts.get(status, 0) + 1
-                    priority_counts[priority] = priority_counts.get(priority, 0) + 1
-                    technician_counts[technician] = technician_counts.get(technician, 0) + 1
-    
-                story.append(Spacer(1, 10))
-                story.append(Paragraph("Status Breakdown:", styles['Heading3']))
-                for status, count in sorted(status_counts.items()):
-                    percentage = (count / len(cm_data)) * 100
-                    story.append(Paragraph(f"• {status}: {count} ({percentage:.1f}%)", styles['Normal']))
-    
-                story.append(Spacer(1, 10))
-                story.append(Paragraph("Priority Distribution:", styles['Heading3']))
-                for priority, count in sorted(priority_counts.items()):
-                    percentage = (count / len(cm_data)) * 100
-                    story.append(Paragraph(f"• {priority}: {count} ({percentage:.1f}%)", styles['Normal']))
-    
-                story.append(Spacer(1, 10))
-                story.append(Paragraph("Assigned Technicians:", styles['Heading3']))
-                for tech, count in sorted(technician_counts.items(), key=lambda x: x[1], reverse=True):
-                    percentage = (count / len(cm_data)) * 100
-                    story.append(Paragraph(f"• {tech}: {count} ({percentage:.1f}%)", styles['Normal']))
-        
-            # Build PDF
-            doc.build(story)
-    
-            messagebox.showinfo("Export Successful", 
-                              f"CM report exported successfully!\n\n"
-                              f"File: {filename}\n"
-                              f"Records exported: {len(cm_data)}")
-    
-            self.update_status(f"CM report exported: {filename}")
-    
-        except Exception as e:
-            messagebox.showerror("PDF Creation Error", f"Failed to create PDF: {str(e)}")
-            raise
-    
-    
-    
-    
-    
-    
-    
-    def export_pm_history_to_pdf(self):
-        """Export PM history search results to PDF"""
-        try:
-            # Check if there are results to export
-            items = self.history_search_tree.get_children()
-            if not items:
-                messagebox.showwarning("No Data", "No search results to export. Please perform a search first.")
-                return
-
-            # Get search term for filename
-            search_term = self.history_search_var.get().strip()
-            search_suffix = f"_{search_term}" if search_term else "_All_Results"
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"PM_History_Export{search_suffix}_{timestamp}.pdf"
-
-            # Create PDF document
-            doc = SimpleDocTemplate(filename, pagesize=letter,
-                                rightMargin=36, leftMargin=36,
-                                topMargin=36, bottomMargin=36)
-
-            story = []
-            styles = getSampleStyleSheet()
-
-            # Custom styles
-            title_style = ParagraphStyle('TitleStyle', parent=styles['Title'], 
-                                    fontSize=16, textColor=colors.darkblue, alignment=1)
-        
-            # Header
-            story.append(Paragraph("AIT CMMS - PM HISTORY EXPORT", title_style))
-            story.append(Spacer(1, 20))
-
-            # Report info
-            story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
-        
-            search_info = f"Search Term: '{search_term}'" if search_term else "Search: All Recent Records"
-            story.append(Paragraph(search_info, styles['Normal']))
-            story.append(Paragraph(f"Total Records: {len(items)}", styles['Normal']))
-            story.append(Spacer(1, 20))
-
-            # Create table data
-            table_data = [['BFM No.', 'SAP No.', 'Description', 'PM Type', 'Technician', 'Date', 'Hours']]
-
-            # Get data from treeview
-            for item in items:
-                values = self.history_search_tree.item(item)['values']
-                # Truncate description if too long for PDF
-                if len(values) >= 3 and values[2]:
-                    description = values[2][:40] + '...' if len(str(values[2])) > 40 else str(values[2])
-                else:
-                    description = ''
-            
-                row_data = [
-                    str(values[0]) if len(values) > 0 else '',  # BFM No
-                    str(values[1]) if len(values) > 1 else '',  # SAP No  
-                    description,                                 # Description (truncated)
-                    str(values[3]) if len(values) > 3 else '',  # PM Type
-                    str(values[4]) if len(values) > 4 else '',  # Technician
-                    str(values[5]) if len(values) > 5 else '',  # Date
-                    str(values[6]) if len(values) > 6 else ''   # Hours
-                ]
-                table_data.append(row_data)
-
-            # Create table
-            table = Table(table_data, colWidths=[1*inch, 0.8*inch, 2*inch, 0.8*inch, 1.2*inch, 0.8*inch, 0.6*inch])
-        
-            table.setStyle(TableStyle([
-                # Header row styling
-                ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 10),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                
-                # Data rows styling
-                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
-                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 1), (-1, -1), 8),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                ('LEFTPADDING', (0, 0), (-1, -1), 3),
-                ('RIGHTPADDING', (0, 0), (-1, -1), 3),
-                ('TOPPADDING', (0, 0), (-1, -1), 2),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 2)
-            ]))
-
-            story.append(table)
-
-            # Add summary statistics if there's data
-            if len(items) > 1:
-                story.append(Spacer(1, 20))
-                story.append(Paragraph("SUMMARY STATISTICS", styles['Heading2']))
-            
-                # Calculate basic statistics
-                pm_type_counts = {}
-                technician_counts = {}
-                total_hours = 0
-            
-                for item in items:
-                    values = self.history_search_tree.item(item)['values']
-                    if len(values) >= 7:
-                        pm_type = values[3] or 'Unknown'
-                        technician = values[4] or 'Unknown'
-                        hours_str = values[6] or '0h'
-                    
-                        pm_type_counts[pm_type] = pm_type_counts.get(pm_type, 0) + 1
-                        technician_counts[technician] = technician_counts.get(technician, 0) + 1
-                    
-                        # Extract numeric hours
-                        try:
-                            hours_num = float(hours_str.replace('h', ''))
-                            total_hours += hours_num
-                        except:
-                            pass
-
-                # PM Type breakdown
-                story.append(Spacer(1, 10))
-                story.append(Paragraph("PM Type Distribution:", styles['Heading3']))
-                for pm_type, count in sorted(pm_type_counts.items()):
-                    percentage = (count / len(items)) * 100
-                    story.append(Paragraph(f"• {pm_type}: {count} ({percentage:.1f}%)", styles['Normal']))
-
-                # Technician breakdown
-                story.append(Spacer(1, 10))
-                story.append(Paragraph("Technician Distribution:", styles['Heading3']))
-                for tech, count in sorted(technician_counts.items(), key=lambda x: x[1], reverse=True):
-                    percentage = (count / len(items)) * 100
-                    story.append(Paragraph(f"• {tech}: {count} ({percentage:.1f}%)", styles['Normal']))
-
-                # Total hours
-                story.append(Spacer(1, 10))
-                story.append(Paragraph(f"Total Labor Hours: {total_hours:.1f} hours", styles['Normal']))
-                story.append(Paragraph(f"Average Hours per PM: {total_hours/len(items):.1f} hours", styles['Normal']))
-
-            # Build PDF
-            doc.build(story)
-
-            messagebox.showinfo("Export Successful", 
-                              f"PM history exported successfully!\n\n"
-                              f"File: {filename}\n"
-                              f"Records exported: {len(items)}")
-        
-            self.update_status(f"PM history exported to {filename}")
-
-        except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export PM history: {str(e)}")
-            print(f"Export error: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    
-    
-    
-    
-    def add_cm_color_legend(self, parent_frame):
-        """Add color legend for CM status"""
-        legend_frame = ttk.LabelFrame(parent_frame, text="Status Colors", padding=5)
-        legend_frame.pack(side='bottom', fill='x', padx=20, pady=5)
-        
-        legend_items = [
-            ("Open", "#FFEAEA", "#D32F2F"),
-            ("In Progress", "#FFF8E1", "#FF8F00"), 
-            ("Completed", "#F1F8E9", "#388E3C"),
-            ("Cancelled", "#F9F9F9", "#757575")
-        ]
-    
-        for i, (status, bg_color, fg_color) in enumerate(legend_items):
-            legend_label = tk.Label(legend_frame, text=f"  {status}  ", 
-                                bg=bg_color, fg=fg_color, 
-                                relief='solid', borderwidth=1)
-            legend_label.pack(side='left', padx=5, pady=2)
-    
-    def filter_cm_list(self, *args):
-        """Filter CM list based on search term and status"""
-        search_term = self.cm_search_var.get().lower()
-        status_filter = self.cm_status_filter_var.get()
-    
+    def check_empty_database_and_offer_restore(self):
+        """Check if database is empty and offer to restore from backup"""
         try:
             cursor = self.conn.cursor()
-        
-            # Build the SQL query with filters
-            base_query = '''
-                SELECT cm_number, bfm_equipment_no, description, priority, 
-                    assigned_technician, status, created_date, completion_date
-                FROM corrective_maintenance
-            '''
-        
-            conditions = []
-            params = []
-        
-            # Add search filter
-            if search_term:
-                conditions.append('''
-                    (LOWER(cm_number) LIKE ? OR 
-                     LOWER(bfm_equipment_no) LIKE ? OR 
-                     LOWER(description) LIKE ? OR 
-                     LOWER(assigned_technician) LIKE ?)
-                ''')
-                search_param = f'%{search_term}%'
-                params.extend([search_param, search_param, search_param, search_param])
-        
-            # Add status filter
-            if status_filter != "All":
-                conditions.append('status = ?')
-                params.append(status_filter)
-        
-            # Combine conditions
-            if conditions:
-                query = base_query + ' WHERE ' + ' AND '.join(conditions)
-            else:
-                query = base_query
+            cursor.execute('SELECT COUNT(*) FROM equipment')
+            equipment_count = cursor.fetchone()[0]
             
-            query += ' ORDER BY created_date DESC'
+            if equipment_count == 0:
+                # Database is empty, offer restore
+                result = messagebox.askyesno(
+                    "Empty Database Detected",
+                    "The database appears to be empty.\n\n"
+                    "Would you like to restore data from a previous backup?\n\n"
+                    "Click 'Yes' to browse available backups\n"
+                    "Click 'No' to continue with empty database",
+                    icon='question'
+                )
+                
+                if result:
+                    self.create_database_restore_dialog()
+                    
+        except Exception as e:
+            print(f"Error checking empty database: {e}")
+    
+    
+    def create_database_restore_dialog(self):
+        """Create dialog to restore database from SharePoint backups - FIXED with proper buttons"""
+        if not hasattr(self, 'backup_sync_dir') or not self.backup_sync_dir:
+            messagebox.showerror("Error", "No backup directory configured. Please restart the application.")
+            return
+    
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Restore Database from Backup")
+        dialog.geometry("1000x700")  # Made larger
+        dialog.transient(self.root)
+        dialog.grab_set()
+    
+        # Instructions
+        instructions_frame = ttk.LabelFrame(dialog, text="Database Restore", padding=15)
+        instructions_frame.pack(fill='x', padx=10, pady=5)
         
-            cursor.execute(query, params)
-            filtered_cms = cursor.fetchall()
+        instructions_text = f"""Select a backup file to restore your database from SharePoint.
+
+    Current backup location: {self.backup_sync_dir}
+
+    WARNING: Restoring a backup will:
+    • Close the current database
+    • Replace it with the selected backup
+    • All unsaved changes will be lost
+    • The application will reload with the restored data"""
+    
+        ttk.Label(instructions_frame, text=instructions_text, font=('Arial', 10)).pack(anchor='w')
+    
+        # Backup files list
+        files_frame = ttk.LabelFrame(dialog, text="Available Backup Files (Last 15)", padding=10)
+        files_frame.pack(fill='both', expand=True, padx=10, pady=5)
+    
+        # Create treeview for backup files
+        self.backup_files_tree = ttk.Treeview(files_frame,
+                                            columns=('Filename', 'Date Created', 'Size', 'Age'),
+                                            show='headings')
+    
+        # Configure columns
+        backup_columns = {
+            'Filename': ('Backup Filename', 350),
+            'Date Created': ('Date Created', 150),
+            'Size': ('File Size', 100),
+            'Age': ('Age (Days)', 100)
+        }
+    
+        for col, (heading, width) in backup_columns.items():
+            self.backup_files_tree.heading(col, text=heading)
+            self.backup_files_tree.column(col, width=width)
+    
+        # Scrollbars
+        backup_v_scrollbar = ttk.Scrollbar(files_frame, orient='vertical', command=self.backup_files_tree.yview)
+        backup_h_scrollbar = ttk.Scrollbar(files_frame, orient='horizontal', command=self.backup_files_tree.xview)
+        self.backup_files_tree.configure(yscrollcommand=backup_v_scrollbar.set, xscrollcommand=backup_h_scrollbar.set)
+        
+        # Pack treeview and scrollbars
+        self.backup_files_tree.grid(row=0, column=0, sticky='nsew')
+        backup_v_scrollbar.grid(row=0, column=1, sticky='ns')
+        backup_h_scrollbar.grid(row=1, column=0, sticky='ew')
+        
+        files_frame.grid_rowconfigure(0, weight=1)
+        files_frame.grid_columnconfigure(0, weight=1)
+        
+        # Selection info
+        selection_frame = ttk.LabelFrame(dialog, text="Selected Backup Info", padding=10)
+        selection_frame.pack(fill='x', padx=10, pady=5)
+    
+        self.backup_info_label = ttk.Label(selection_frame, text="Loading backup files...", 
+                                        font=('Arial', 10), foreground='blue')
+        self.backup_info_label.pack(anchor='w')
+    
+        # Bind selection event
+        self.backup_files_tree.bind('<<TreeviewSelect>>', self.on_backup_file_select)
+    
+        # Action buttons - FIXED with proper layout
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(side='bottom', fill='x', padx=10, pady=15)
+    
+        # Left side buttons
+        left_buttons = ttk.Frame(button_frame)
+        left_buttons.pack(side='left')
+    
+        ttk.Button(left_buttons, text="Refresh List", 
+                command=self.load_backup_files).pack(side='left', padx=5)
+        ttk.Button(left_buttons, text="Preview Backup", 
+                command=self.preview_selected_backup).pack(side='left', padx=5)
+    
+        # Right side buttons  
+        right_buttons = ttk.Frame(button_frame)
+        right_buttons.pack(side='right')
+    
+        ttk.Button(right_buttons, text="Cancel", 
+                command=dialog.destroy).pack(side='right', padx=5)
+    
+        # Main restore button - prominent in center
+        center_buttons = ttk.Frame(button_frame)
+        center_buttons.pack(expand=True)
+        
+        self.restore_button = ttk.Button(center_buttons, text="RESTORE SELECTED BACKUP", 
+                                        command=self.restore_selected_backup, 
+                                        state='disabled',
+                                        width=25)
+        self.restore_button.pack(pady=5)
+    
+        # Load backup files after creating the dialog
+        self.root.after(100, self.load_backup_files)  # Load after dialog is fully created
+
+    
+    
+
+    def load_backup_files(self):
+        """Load available backup files from SharePoint - FIXED to show multiple files"""
+        try:
+            if not os.path.exists(self.backup_sync_dir):
+                if hasattr(self, 'backup_info_label'):
+                    self.backup_info_label.config(text="Backup directory not found", foreground='red')
+                return
         
             # Clear existing items
-            for item in self.cm_tree.get_children():
-                self.cm_tree.delete(item)
+            for item in self.backup_files_tree.get_children():
+                self.backup_files_tree.delete(item)
         
-            # Add filtered CM records
-            for cm in filtered_cms:
-                cm_number, bfm_no, description, priority, assigned, status, created_date, completion_date = cm
-            
-                # Truncate description for display
-                display_desc = (description[:37] + '...') if description and len(description) > 40 else (description or '')
-            
-                # Format dates for display
-                created_display = created_date if created_date else ''
-                completed_display = completion_date if completion_date else ''
-            
-                values = (cm_number, bfm_no, display_desc, priority, assigned, status, created_display, completed_display)
-                self.cm_tree.insert_with_color('', 'end', values=values)
-        
-            # Update status with count
-            self.update_status(f"Showing {len(filtered_cms)} CMs" + (f" (filtered)" if search_term or status_filter != "All" else ""))
-        
-        except Exception as e:
-            print(f"Error filtering CM list: {e}")
-
-    def clear_cm_filters(self):
-        """Clear all CM filters and reload full list"""
-        self.cm_search_var.set("")
-        self.cm_status_filter_var.set("All")
-        self.load_corrective_maintenance()
-        self.update_status("CM filters cleared")
-    
-    def debug_cm_completion_dates(self):
-        """Debug method to check CM completion dates in database"""
-        try:
-            cursor = self.conn.cursor()
-        
-            print("=== CM Database Structure Check ===")
-            cursor.execute("PRAGMA table_info(corrective_maintenance)")
-            columns = cursor.fetchall()
-            print("Columns in corrective_maintenance table:")
-            for col in columns:
-                print(f"  {col[1]} ({col[2]}) - Not Null: {col[3]}, Default: {col[4]}")
-        
-            print("\n=== Sample CM Records ===")
-            cursor.execute('''
-                SELECT cm_number, status, created_date, completion_date 
-                FROM corrective_maintenance 
-                ORDER BY created_date DESC 
-                LIMIT 10
-            ''')
-        
-            records = cursor.fetchall()
-            print("Sample records (CM Number | Status | Created Date | Completion Date):")
-            for record in records:
-                cm_num, status, created, completed = record
-                print(f"  {cm_num} | {status} | {created} | {completed}")
-        
-            print("\n=== Completed CMs Only ===")
-            cursor.execute('''
-                SELECT cm_number, status, created_date, completion_date 
-                FROM corrective_maintenance 
-                WHERE status = 'Completed'
-                ORDER BY created_date DESC 
-                LIMIT 10
-            ''')
-        
-            completed_records = cursor.fetchall()
-            print("Completed CMs (CM Number | Status | Created Date | Completion Date):")
-            for record in completed_records:
-                cm_num, status, created, completed = record
-                print(f"  {cm_num} | {status} | {created} | {completed}")
-            
-        except Exception as e:
-            print(f"Error in debug method: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    
-    
-   
-    def update_equipment_suggestions(self, event):
-        """Update equipment suggestions in completion form"""
-        search_term = self.completion_bfm_var.get().lower()
-    
-        if len(search_term) >= 2:
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT bfm_equipment_no FROM equipment 
-                WHERE LOWER(bfm_equipment_no) LIKE ? OR LOWER(description) LIKE ?
-                ORDER BY bfm_equipment_no LIMIT 10
-            ''', (f'%{search_term}%', f'%{search_term}%'))
-        
-            suggestions = [row[0] for row in cursor.fetchall()]
-            self.bfm_combo['values'] = suggestions
-   
-   
-   
-   
-   
-   
-    def configure_equipment_tree_grid(self):
-        """Configure grid lines for equipment tree"""
-        style = ttk.Style()
-    
-        # Create a custom style with more visible grid
-        style.configure("Grid.Treeview",
-                       background="white",
-                       foreground=ModernCMMSStyles.DARK,
-                       fieldbackground="white",
-                       font=ModernCMMSStyles.BODY_FONT,
-                       rowheight=25,
-                       relief="solid",
-                       borderwidth=1)
-    
-        style.configure("Grid.Treeview.Heading",
-                       background=ModernCMMSStyles.PRIMARY,
-                       foreground="white",
-                       font=ModernCMMSStyles.SUBHEADER_FONT,
-                       relief="solid",
-                       borderwidth=1)
-    
-        # Apply the grid style to equipment tree
-        self.equipment_tree.configure(style="Grid.Treeview")
-        # After creating self.equipment_tree, add:
-        self.configure_equipment_tree_grid()
-   
-   
-   
-   
-   
-    def get_recent_backup_files(self, count=5):
-        """Get the most recent backup files"""
-        try:
-            if not hasattr(self, 'backup_sync_dir') or not self.backup_sync_dir:
-                return []
-        
-            backup_dir = self.backup_sync_dir
-            if not os.path.exists(backup_dir):
-                return []
-        
+            # Get all backup files
             backup_files = []
-            for f in os.listdir(backup_dir):
-                if f.startswith('ait_cmms_backup_') and f.endswith('.db'):
-                    full_path = os.path.join(backup_dir, f)
-                    backup_files.append((full_path, os.path.getmtime(full_path), f))
-        
-            # Sort by modification time, newest first
-            backup_files.sort(key=lambda x: x[1], reverse=True)
-        
-            # Return the most recent 'count' backups
-            return backup_files[:count]
-        
-        except Exception as e:
-            print(f"Error getting backup files: {e}")
-            return []
-
-    def restore_from_backup_dialog(self):
-        """Show dialog to select and restore from backup"""
-        try:
-            # Get recent backup files
-            backup_files = self.get_recent_backup_files(5)
-        
-            if not backup_files:
-                messagebox.showwarning("No Backups Found", 
-                                     "No backup files found in the backup directory.\n\n"
-                                     "Backup directory: " + str(getattr(self, 'backup_sync_dir', 'Not configured')))
+            try:
+                all_files = os.listdir(self.backup_sync_dir)
+                print(f"DEBUG: Found {len(all_files)} total files in backup directory")
+            
+                for filename in all_files:
+                    if filename.startswith('ait_cmms_backup_') and filename.endswith('.db'):
+                        file_path = os.path.join(self.backup_sync_dir, filename)
+                        try:
+                            # Get file stats
+                            stat = os.stat(file_path)
+                            file_size = stat.st_size
+                            modified_time = datetime.fromtimestamp(stat.st_mtime)
+                            age_days = (datetime.now() - modified_time).days
+                        
+                            backup_files.append({
+                                'filename': filename,
+                                'filepath': file_path,
+                                'size': file_size,
+                                'modified': modified_time,
+                                'age_days': age_days
+                            })
+                            print(f"DEBUG: Added backup file: {filename}")
+                        except Exception as e:
+                            print(f"Error reading backup file {filename}: {e}")
+                            continue
+            except Exception as e:
+                print(f"Error listing backup directory: {e}")
+                if hasattr(self, 'backup_info_label'):
+                    self.backup_info_label.config(text=f"Error reading backup directory: {str(e)}", foreground='red')
                 return
         
-            # Create selection dialog
-            dialog = tk.Toplevel(self.root)
-            dialog.title("Restore Database from Backup")
-            dialog.geometry("700x400")
-            dialog.transient(self.root)
-            dialog.grab_set()
+            print(f"DEBUG: Total backup files found: {len(backup_files)}")
         
-            # Instructions
-            instructions_frame = ttk.LabelFrame(dialog, text="Select Backup to Restore", padding=15)
-            instructions_frame.pack(fill='x', padx=10, pady=5)
-        
-            ttk.Label(instructions_frame, 
-                    text="WARNING: This will replace your current database with the selected backup.\n"
-                        "Make sure to create a backup of your current data first!",
-                    font=('Arial', 10, 'bold'), foreground='red').pack(pady=5)
-        
-            # Backup list
-            list_frame = ttk.LabelFrame(dialog, text="Available Backups", padding=10)
-            list_frame.pack(fill='both', expand=True, padx=10, pady=5)
-        
-            # Create treeview for backup selection
-            backup_tree = ttk.Treeview(list_frame,
-                                      columns=('Filename', 'Date', 'Size'),
-                                      show='headings',
-                                      height=8)
-        
-            backup_tree.heading('Filename', text='Backup File')
-            backup_tree.heading('Date', text='Created Date')
-            backup_tree.heading('Size', text='File Size')
-        
-            backup_tree.column('Filename', width=300)
-            backup_tree.column('Date', width=200)
-            backup_tree.column('Size', width=100)
+            # Sort by modification time (newest first)
+            backup_files.sort(key=lambda x: x['modified'], reverse=True)
             
-            # Populate backup list
-            for full_path, mod_time, filename in backup_files:
-                try:
-                    file_size = os.path.getsize(full_path)
-                    size_mb = file_size / (1024 * 1024)
-                    size_str = f"{size_mb:.1f} MB"
-                    
-                    date_str = datetime.fromtimestamp(mod_time).strftime('%Y-%m-%d %H:%M:%S')
-                    
-                    backup_tree.insert('', 'end', values=(filename, date_str, size_str),
-                                    tags=(full_path,))
+            # Limit to last 15 backups for better performance
+            backup_files = backup_files[:15]
+        
+            # Add to tree
+            for backup in backup_files:
+                # Format file size
+                size_mb = backup['size'] / (1024 * 1024)
+                size_str = f"{size_mb:.1f} MB" if size_mb >= 1 else f"{backup['size']} bytes"
+            
+                item_id = self.backup_files_tree.insert('', 'end', values=(
+                    backup['filename'],
+                    backup['modified'].strftime('%Y-%m-%d %H:%M:%S'),
+                    size_str,
+                    f"{backup['age_days']} days"
+                ))
+            
+                print(f"DEBUG: Inserted item: {backup['filename']}")
+        
+            # Update info label
+            if hasattr(self, 'backup_info_label'):
+                if backup_files:
+                    self.backup_info_label.config(text=f"Found {len(backup_files)} backup files", foreground='green')
+                else:
+                    self.backup_info_label.config(text="No backup files found in directory", foreground='orange')
                 
-                except Exception as e:
-                    print(f"Error processing backup file {filename}: {e}")
-        
-            backup_tree.pack(fill='both', expand=True, padx=5, pady=5)
-        
-            def restore_selected_backup():
-                """Restore the selected backup"""
-                selected = backup_tree.selection()
-                if not selected:
-                    messagebox.showwarning("No Selection", "Please select a backup file to restore")
-                    return
-            
-                # Get the selected backup path
-                item = backup_tree.item(selected[0])
-                backup_path = backup_tree.item(selected[0])['tags'][0]
+        except Exception as e:
+            print(f"Error loading backup files: {e}")
+            if hasattr(self, 'backup_info_label'):
+                self.backup_info_label.config(text=f"Error loading backups: {str(e)}", foreground='red')
+
+
+    def on_backup_file_select(self, event):
+        """Handle backup file selection - ENHANCED"""
+        try:
+            selected = self.backup_files_tree.selection()
+            if selected:
+                item = self.backup_files_tree.item(selected[0])
                 filename = item['values'][0]
+                date_created = item['values'][1]
+                file_size = item['values'][2]
+                age = item['values'][3]
+                
+                # Show backup info
+                info_text = f"✓ SELECTED: {filename}\n"
+                info_text += f"Created: {date_created}\n"
+                info_text += f"Size: {file_size}\n"
+                info_text += f"Age: {age}\n\n"
+                info_text += "Click 'RESTORE SELECTED BACKUP' to proceed"
             
-                # Final confirmation
-                result = messagebox.askyesno("Confirm Restore",
-                                           f"Are you sure you want to restore from:\n\n"
-                                           f"{filename}\n\n"
-                                           f"This will:\n"
-                                           f"• Close the current database\n"
-                                           f"• Backup your current database\n"
-                                           f"• Replace it with the selected backup\n"
-                                           f"• Restart the application\n\n"
-                                           f"Continue?",
-                                           icon='warning')
+                self.backup_info_label.config(text=info_text, foreground='darkgreen')
             
-                if result:
-                    dialog.destroy()
-                    self.perform_database_restore(backup_path, filename)
+                # Enable restore button
+                self.restore_button.config(state='normal')
+                self.restore_button.config(text=f"RESTORE: {filename}")
+            else:
+                self.backup_info_label.config(text="Select a backup file to see details", foreground='gray')
+                self.restore_button.config(state='disabled')
+                self.restore_button.config(text="RESTORE SELECTED BACKUP")
+        except Exception as e:
+            print(f"Error in backup file selection: {e}")
+            self.backup_info_label.config(text="Error selecting backup file", foreground='red')
+
+
+    def preview_selected_backup(self):
+        """Preview selected backup file contents"""
+        selected = self.backup_files_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please select a backup file to preview")
+            return
+    
+        try:
+            item = self.backup_files_tree.item(selected[0])
+            filename = item['values'][0]
+            filepath = os.path.join(self.backup_sync_dir, filename)
         
-            def create_backup_first():
-                """Create a backup before restoring"""
+            if not os.path.exists(filepath):
+                messagebox.showerror("Error", f"Backup file not found: {filename}")
+                return
+        
+            # Create preview dialog
+            preview_dialog = tk.Toplevel(self.root)
+            preview_dialog.title(f"Preview Backup: {filename}")
+            preview_dialog.geometry("800x600")
+            preview_dialog.transient(self.root)
+            preview_dialog.grab_set()
+        
+            # Preview text area
+            text_frame = ttk.Frame(preview_dialog)
+            text_frame.pack(fill='both', expand=True, padx=10, pady=10)
+            
+            preview_text = tk.Text(text_frame, wrap='word', font=('Courier', 10))
+            scrollbar = ttk.Scrollbar(text_frame, orient='vertical', command=preview_text.yview)
+            preview_text.configure(yscrollcommand=scrollbar.set)
+            
+            preview_text.pack(side='left', fill='both', expand=True)
+            scrollbar.pack(side='right', fill='y')
+            
+            # Connect to backup database and get preview info
+            try:
+                backup_conn = sqlite3.connect(filepath)
+                backup_cursor = backup_conn.cursor()
+                
+                preview_info = f"BACKUP DATABASE PREVIEW\n"
+                preview_info += f"File: {filename}\n"
+                preview_info += f"=" * 80 + "\n\n"
+                
+                # Get table counts
+                tables = [
+                    ('equipment', 'Equipment/Assets'),
+                    ('pm_completions', 'PM Completions'),
+                    ('weekly_pm_schedules', 'Weekly Schedules'),
+                    ('corrective_maintenance', 'Corrective Maintenance'),
+                    ('cannot_find_assets', 'Cannot Find Assets'),
+                    ('run_to_failure_assets', 'Run to Failure Assets'),
+                    ('pm_templates', 'PM Templates')
+                ]
+            
+                preview_info += "DATABASE CONTENTS:\n"
+                preview_info += "-" * 40 + "\n"
+            
+                total_records = 0
+                for table_name, display_name in tables:
+                    try:
+                        backup_cursor.execute(f'SELECT COUNT(*) FROM {table_name}')
+                        count = backup_cursor.fetchone()[0]
+                        total_records += count
+                        preview_info += f"{display_name}: {count} records\n"
+                    except Exception as e:
+                        preview_info += f"{display_name}: Error reading ({str(e)})\n"
+            
+                preview_info += f"\nTotal Records: {total_records}\n\n"
+            
+                # Get some sample equipment data
                 try:
-                    if hasattr(self, 'backup_sync_dir'):
-                        self.sharepoint_only_backup(self.backup_sync_dir)
-                        messagebox.showinfo("Backup Created", 
-                                          "Current database backed up successfully.\n"
-                                          "You can now safely restore from a previous backup.")
-                    else:
-                        messagebox.showwarning("Backup Failed", 
-                                            "Could not create backup - backup directory not configured.")
-                except Exception as e:
-                    messagebox.showerror("Backup Error", f"Failed to create backup: {str(e)}")
+                    backup_cursor.execute('''
+                        SELECT bfm_equipment_no, description, status 
+                        FROM equipment 
+                        ORDER BY updated_date DESC 
+                        LIMIT 10
+                    ''')
+                    equipment_sample = backup_cursor.fetchall()
+                
+                    if equipment_sample:
+                        preview_info += "RECENT EQUIPMENT (Sample):\n"
+                        preview_info += "-" * 40 + "\n"
+                        for bfm_no, desc, status in equipment_sample:
+                            desc_short = (desc[:30] + '...') if desc and len(desc) > 30 else (desc or 'No description')
+                            preview_info += f"{bfm_no}: {desc_short} ({status or 'Active'})\n"
+                        preview_info += "\n"
+                except:
+                    pass
+            
+                # Get recent PM completions
+                try:
+                    backup_cursor.execute('''
+                        SELECT completion_date, COUNT(*) as count
+                        FROM pm_completions 
+                        GROUP BY completion_date 
+                        ORDER BY completion_date DESC 
+                        LIMIT 10
+                    ''')
+                    pm_dates = backup_cursor.fetchall()
+                
+                    if pm_dates:
+                        preview_info += "RECENT PM ACTIVITY:\n"
+                        preview_info += "-" * 40 + "\n"
+                        for date, count in pm_dates:
+                            preview_info += f"{date}: {count} PM completions\n"
+                        preview_info += "\n"
+                except:
+                    pass
+                
+                # Database metadata
+                try:
+                    backup_cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                    all_tables = [row[0] for row in backup_cursor.fetchall()]
+                    preview_info += f"DATABASE STRUCTURE:\n"
+                    preview_info += "-" * 40 + "\n"
+                    preview_info += f"Total Tables: {len(all_tables)}\n"
+                    preview_info += f"Tables: {', '.join(all_tables)}\n"
+                except:
+                    pass
+            
+                backup_conn.close()
+            
+                preview_text.insert('1.0', preview_info)
+                preview_text.config(state='disabled')
+            
+            except Exception as e:
+                preview_text.insert('1.0', f"Error previewing backup database:\n{str(e)}")
+                preview_text.config(state='disabled')
         
-            # Buttons
-            button_frame = ttk.Frame(dialog)
-            button_frame.pack(side='bottom', fill='x', padx=10, pady=10)
-        
-            ttk.Button(button_frame, text="Create Backup First", 
-                    command=create_backup_first).pack(side='left', padx=5)
-            ttk.Button(button_frame, text="Restore Selected", 
-                    command=restore_selected_backup).pack(side='left', padx=10)
-            ttk.Button(button_frame, text="Cancel", 
-                    command=dialog.destroy).pack(side='right', padx=5)
+            # Close button
+            ttk.Button(preview_dialog, text="Close", command=preview_dialog.destroy).pack(pady=10)
         
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to open restore dialog: {str(e)}")
+            messagebox.showerror("Preview Error", f"Failed to preview backup: {str(e)}")
 
-    def perform_database_restore(self, backup_path, backup_filename):
-        """Perform the actual database restore"""
+    def restore_selected_backup(self):
+        """Restore the selected backup file"""
+        selected = self.backup_files_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please select a backup file to restore")
+            return
+    
         try:
-            current_db = 'ait_cmms_database.db'
+            item = self.backup_files_tree.item(selected[0])
+            filename = item['values'][0]
+            date_created = item['values'][1]
+            file_size = item['values'][2]
         
-            # Create backup of current database
-            current_backup = f"{current_db}.before_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            # Get the full file path
+            source_filepath = os.path.join(self.backup_sync_dir, filename)
+        
+            if not os.path.exists(source_filepath):
+                messagebox.showerror("Error", f"Backup file not found: {filename}")
+                return
+        
+            # Confirmation dialog with detailed info
+            confirm_msg = f"""RESTORE DATABASE FROM BACKUP
+
+    Selected Backup:
+    • File: {filename}
+    • Created: {date_created}
+    • Size: {file_size}
+
+    WARNING: This action will:
+    • Close the current database
+    • Replace it completely with the backup data
+    • All current unsaved changes will be lost
+    • The application will reload with the backup data
+
+    This action cannot be undone.
+
+    Are you sure you want to proceed?"""
+        
+            result = messagebox.askyesno("Confirm Database Restore", confirm_msg, 
+                                        icon='warning', default='no')
+        
+            if not result:
+                return
+        
+            # Create progress dialog
+            progress_dialog = tk.Toplevel(self.root)
+            progress_dialog.title("Restoring Database...")
+            progress_dialog.geometry("400x150")
+            progress_dialog.transient(self.root)
+            progress_dialog.grab_set()
             
-            # Close current database connection
+            ttk.Label(progress_dialog, text="Restoring database from backup...", 
+                    font=('Arial', 12)).pack(pady=20)
+        
+            progress_var = tk.StringVar(value="Preparing restore...")
+            progress_label = ttk.Label(progress_dialog, textvariable=progress_var)
+            progress_label.pack(pady=10)
+            
+            progress_bar = ttk.Progressbar(progress_dialog, mode='indeterminate')
+            progress_bar.pack(pady=10, padx=20, fill='x')
+            progress_bar.start()
+        
+            # Update GUI
+            self.root.update()
+            
+            # Perform the restore
+            current_db_path = 'ait_cmms_database.db'
+        
+            # Step 1: Close current database connection
+            progress_var.set("Closing current database...")
+            self.root.update()
+        
             if hasattr(self, 'conn'):
-                self.conn.close()
+                try:
+                    self.conn.close()
+                except:
+                    pass
         
-            # Backup current database
-            if os.path.exists(current_db):
-                shutil.copy2(current_db, current_backup)
-                print(f"Current database backed up to: {current_backup}")
+            # Step 2: Backup current database (just in case)
+            progress_var.set("Backing up current database...")
+            self.root.update()
         
-            # Restore from backup
-            shutil.copy2(backup_path, current_db)
-            
-            # Reopen database connection
-            self.conn = sqlite3.connect(current_db)
+            if os.path.exists(current_db_path):
+                backup_current_path = f"{current_db_path}.pre_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                shutil.copy2(current_db_path, backup_current_path)
         
-            messagebox.showinfo("Restore Complete", 
-                              f"Database successfully restored from:\n{backup_filename}\n\n"
-                              f"Your previous database was saved as:\n{current_backup}\n\n"
-                              f"The application will now refresh all data.")
+            # Step 3: Copy backup to current location
+            progress_var.set("Restoring backup data...")
+            self.root.update()
         
-            # Refresh all data
+            shutil.copy2(source_filepath, current_db_path)
+        
+            # Step 4: Reconnect to database
+            progress_var.set("Reconnecting to database...")
+            self.root.update()
+        
+            self.conn = sqlite3.connect(current_db_path)
+        
+            # Step 5: Refresh all data displays
+            progress_var.set("Refreshing application data...")
+            self.root.update()
+        
+            # Refresh all displays
             self.load_equipment_data()
             self.refresh_equipment_list()
             self.load_recent_completions()
@@ -2146,103 +678,145 @@ class AITCMMSSystem:
                 self.load_cannot_find_assets()
             if hasattr(self, 'load_run_to_failure_assets'):
                 self.load_run_to_failure_assets()
+            if hasattr(self, 'load_pm_templates'):
+                self.load_pm_templates()
         
             # Update statistics
-            if self.current_user_role == 'Manager':
+            if hasattr(self, 'update_equipment_statistics'):
                 self.update_equipment_statistics()
-                self.update_dashboard_cards()
         
-            self.update_status(f"Database restored from {backup_filename}")
+            progress_bar.stop()
+            progress_dialog.destroy()
+        
+            # Close the restore dialog
+            if hasattr(self, 'backup_files_tree'):
+                # Find and close the restore dialog
+                for widget in self.root.winfo_children():
+                    if isinstance(widget, tk.Toplevel) and "Restore Database" in widget.title():
+                        widget.destroy()
+                        break
+        
+            # Show success message
+            messagebox.showinfo("Restore Complete", 
+                               f"Database successfully restored from backup!\n\n"
+                               f"Restored from: {filename}\n"
+                               f"Created: {date_created}\n"
+                               f"The application has been refreshed with the restored data.")
+        
+            self.update_status(f"Database restored from backup: {filename}")
         
         except Exception as e:
-            messagebox.showerror("Restore Failed", 
-                            f"Failed to restore database: {str(e)}\n\n"
-                            f"Your original database should still be intact.")
-            # Try to reopen the original database
+            # Try to reconnect to original database
             try:
                 self.conn = sqlite3.connect('ait_cmms_database.db')
             except:
                 pass
+        
+            messagebox.showerror("Restore Error", f"Failed to restore database backup:\n\n{str(e)}")
+            print(f"Database restore error: {e}")
+
+    def add_database_restore_button(self):
+        """Add database restore button to the equipment tab"""
+        try:
+            if hasattr(self, 'equipment_frame'):
+                 #Find the controls frame and add the button
+                for widget in self.equipment_frame.winfo_children():
+                    if isinstance(widget, ttk.LabelFrame) and "Equipment Controls" in widget['text']:
+                        ttk.Button(widget, text="📁 Restore Database from Backup", 
+                                 command=self.create_database_restore_dialog,
+                                 width=30).pack(side='left', padx=5)
+                        break
+        except Exception as e:
+            print(f"Error adding restore button: {e}")
+    
+    
+    
+    
+    
+    def add_logo_to_main_window(self):
+        """Add AIT logo to the main application window - LEFT SIDE ONLY"""
+        try:
+            from tkinter import PhotoImage
+            from PIL import Image, ImageTk
+            
+            # Get the directory where the script is located
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            img_dir = os.path.join(script_dir, "img")
+            logo_path = os.path.join(img_dir, "ait_logo.png")
+        
+            # Create img directory if it doesn't exist
+            if not os.path.exists(img_dir):
+                os.makedirs(img_dir)
+                print(f"Created img directory: {img_dir}")
+        
+            # Alternative paths to try
+            alternative_paths = [
+                os.path.join(script_dir, "ait_logo.png"),  # Same directory as script
+                os.path.join(script_dir, "img", "ait_logo.png"),  # img subdirectory
+                "ait_logo.png"  # Current working directory
+            ]
+        
+            logo_found = False
+            for path in alternative_paths:
+                if os.path.exists(path):
+                    logo_path = path
+                    logo_found = True
+                    print(f"Found logo at: {logo_path}")
+                    break
+        
+            if not logo_found:
+                print(f"Logo file not found. Tried paths: {alternative_paths}")
+                print("Please place your logo file in one of these locations.")
+                return
+            
+            if os.path.exists(logo_path):
+                # Open and resize image for tkinter
+                pil_image = Image.open(logo_path)
+                pil_image = pil_image.resize((200, 60), Image.Resampling.LANCZOS)  # Reasonable size for left corner
+                
+                # Convert to PhotoImage
+                self.logo_image = ImageTk.PhotoImage(pil_image)
+                
+                # Create logo frame at top left of window
+                logo_frame = ttk.Frame(self.root)
+                logo_frame.pack(side='top', fill='x', padx=10, pady=5)
+            
+                # Add logo label (left aligned)
+                logo_label = ttk.Label(logo_frame, image=self.logo_image)
+                logo_label.pack(side='left')
+                
+                # Optional: Add a subtle separator line below
+                separator = ttk.Separator(self.root, orient='horizontal')
+                separator.pack(fill='x', padx=10, pady=2)
+            
+        except ImportError:
+            print("PIL (Pillow) not installed. Install with: pip install Pillow")
+        except Exception as e:
+            print(f"Error loading logo: {e}")
+    
+    
     
     
     def sync_database_on_startup(self):
-        """Download and sync with latest database backup from SharePoint"""
+        """Lighter sync check after initialization (already handled in pre-init)"""
         try:
             if not hasattr(self, 'backup_sync_dir'):
-                print("No backup directory configured, skipping sync")
                 return False
-            
-            backup_dir = self.backup_sync_dir
-            local_db = 'ait_cmms_database.db'
         
-            print("Checking for latest database backup in SharePoint...")
-        
-            # Get all backup files from SharePoint folder
-            if not os.path.exists(backup_dir):
-                print("SharePoint backup folder not found, skipping sync")
-                return False
-            
-            backup_files = []
-            for f in os.listdir(backup_dir):
-                if f.startswith('ait_cmms_backup_') and f.endswith('.db'):
-                    full_path = os.path.join(backup_dir, f)
-                    backup_files.append((full_path, os.path.getmtime(full_path)))
-        
-            if not backup_files:
-                print("No backup files found in SharePoint, skipping sync")
-                return False
-            
-            # Find the most recent backup
-            backup_files.sort(key=lambda x: x[1], reverse=True)  # Sort by modification time, newest first
-            latest_backup_path, latest_backup_time = backup_files[0]
-        
-            # Check if local database exists
-            local_db_time = 0
-            if os.path.exists(local_db):
-                local_db_time = os.path.getmtime(local_db)
-            
-            # Compare timestamps
-            if latest_backup_time > local_db_time:
-                # SharePoint backup is newer, replace local database
-                print(f"SharePoint backup is newer, syncing...")
-                print(f"Latest backup: {os.path.basename(latest_backup_path)}")
-            
-                # Close existing connection if open
-                if hasattr(self, 'conn'):
-                    try:
-                        self.conn.close()
-                    except:
-                        pass
-            
-                # Backup current local database (if exists)
-                if os.path.exists(local_db):
-                    backup_local = f"{local_db}.local_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                    shutil.copy2(local_db, backup_local)
-                    print(f"Backed up local database to: {backup_local}")
-            
-                # Copy SharePoint backup to local database
-                shutil.copy2(latest_backup_path, local_db)
-                
-                # Reopen connection
-                self.conn = sqlite3.connect(local_db)
-                
-                print(f"Database synced successfully from SharePoint")
-                self.update_status("Database synced from SharePoint - latest changes loaded")
+            # Just update the status, heavy lifting was done in pre-init sync
+            if os.path.exists('ait_cmms_database.db'):
+                self.update_status("Database loaded - SharePoint sync completed during startup")
                 return True
-            
             else:
-                print("Local database is current, no sync needed")
+                self.update_status("Database initialization completed")
                 return False
             
         except Exception as e:
-            print(f"Error syncing database: {e}")
-            self.update_status(f"Database sync failed: {str(e)}")
-            # Try to reopen local connection if it failed
-            try:
-                self.conn = sqlite3.connect('ait_cmms_database.db')
-            except:
-                pass
+            print(f"Error in startup sync check: {e}")
             return False
+    
+    
+    
     
     
     
@@ -2528,7 +1102,7 @@ class AITCMMSSystem:
                 pass
 
     def cleanup_old_backups(self, backup_dir, keep_last=10):
-        """Keep only the most recent backup files"""
+        """Keep only the most recent backup files in SharePoint"""
         try:
             # Get all backup files
             backup_files = []
@@ -2536,23 +1110,59 @@ class AITCMMSSystem:
                 if f.startswith('ait_cmms_backup_') and f.endswith('.db'):
                     full_path = os.path.join(backup_dir, f)
                     backup_files.append((full_path, os.path.getmtime(full_path)))
-        
+    
             if len(backup_files) <= keep_last:
+                print(f"Only {len(backup_files)} backups found, no cleanup needed")
                 return  # No cleanup needed
-        
+    
             # Sort by modification time (newest first)
             backup_files.sort(key=lambda x: x[1], reverse=True)
         
             # Delete older backups
+            deleted_count = 0
             for old_backup_path, _ in backup_files[keep_last:]:
                 try:
                     os.remove(old_backup_path)
-                    print(f"Removed old backup: {os.path.basename(old_backup_path)}")
+                    print(f"Removed old SharePoint backup: {os.path.basename(old_backup_path)}")
+                    deleted_count += 1
                 except Exception as e:
                     print(f"Error removing old backup {old_backup_path}: {e}")
                 
+            if deleted_count > 0:
+                print(f"Cleaned up {deleted_count} old SharePoint backups, kept {keep_last} most recent")
+            
         except Exception as e:
             print(f"Error cleaning up old backups: {e}")
+    
+    
+    def cleanup_local_backups(self):
+        """Remove old timestamped local backup files, keep only the single local backup"""
+        try:
+            import glob
+        
+            # Find all timestamped local backup files
+            pattern = "ait_cmms_database.db.local_backup_*"
+            old_backups = glob.glob(pattern)
+        
+            removed_count = 0
+            for backup_file in old_backups:
+                try:
+                    os.remove(backup_file)
+                    print(f"Removed old local backup: {backup_file}")
+                    removed_count += 1
+                except Exception as e:
+                    print(f"Error removing {backup_file}: {e}")
+        
+            if removed_count > 0:
+                print(f"Cleaned up {removed_count} old local backup files")
+            
+        except Exception as e:
+            print(f"Error cleaning up local backups: {e}")
+    
+    
+    
+    
+    
     
     def test_backup_now(self):
         """Manual backup test for debugging"""
@@ -4018,20 +2628,72 @@ class AITCMMSSystem:
         """Get current date in standard format"""
         return datetime.now().strftime('%Y-%m-%d')
     
-    
-    
     def __init__(self, root):
         self.root = root
-        self.setup_root_window()  # NEW - Setup window with modern styling
-        
-        # Initialize database
+        self.root.title("AIT Complete CMMS - Computerized Maintenance Management System")
+        self.root.geometry("1800x1000")
+        try:
+            self.root.state('zoomed')  # Maximize window on Windows
+        except:
+            pass  # Skip if not on Windows
+    
+        # ===== ROLE-BASED ACCESS CONTROL =====
+        self.current_user_role = None  # Will be set by login
+        self.user_name = None
+    
+        # Team members as specified - MUST be defined before login dialog
+        self.technicians = [
+            "Mark Michaels", "Jerone Bosarge", "Jon Hymel", "Nick Whisenant", 
+            "James Dunnam", "Wayne Dunnam", "Nate Williams", "Rey Marikit", "Ronald Houghs",
+        ]
+    
+        # Show login dialog after technicians are defined
+        if not self.show_login_dialog():
+            self.root.destroy()
+            return
+    
+       
+
+        # ===== CRITICAL FIX: SET UP SHAREPOINT BACKUP FIRST =====
+        self.backup_sync_dir = self.get_sharepoint_backup_path()
+    
+        # ===== SYNC DATABASE BEFORE INITIALIZING =====
+        # This will download the latest backup if available BEFORE creating local database
+        database_synced = self.sync_database_before_init()
+    
+        # ===== NOW Initialize database (will use synced version if available) =====
         self.init_database()
         self.init_pm_templates_database()
-        self.setup_existing_database_with_sharepoint_backup()
+    
+        # Set up ongoing backup system
+        if self.backup_sync_dir:
+            self.schedule_sharepoint_only_backups(self.backup_sync_dir)
+    
+    
+        # ===== CRITICAL FIX: SET UP SHAREPOINT BACKUP FIRST =====
+        self.backup_sync_dir = self.get_sharepoint_backup_path()
 
-        # SYNC DATABASE ON STARTUP
+        # ===== SYNC DATABASE BEFORE INITIALIZING =====
+        database_synced = self.sync_database_before_init()
+
+        # ===== NOW Initialize database =====
+        self.init_database()
+        self.init_pm_templates_database()
+        # Clean up old local backups (keep only one)
+        self.cleanup_local_backups()
+
+
+        # Set up ongoing backup system
+        if hasattr(self, 'backup_sync_dir') and self.backup_sync_dir:
+            self.schedule_sharepoint_only_backups(self.backup_sync_dir)
+
+        # Light sync check (heavy lifting already done)
         self.sync_database_on_startup()
-
+        
+    
+        # Add logo header
+        self.add_logo_to_main_window()
+    
         # PM Frequencies and cycles
         self.pm_frequencies = {
             'Monthly': 30,
@@ -4039,255 +2701,286 @@ class AITCMMSSystem:
             'Annual': 365,
             'Run Till Failure': 0
         }
-
+    
         # Weekly PM target
         self.weekly_pm_target = 110
-
+    
         # Initialize data storage
         self.equipment_data = []
         self.current_week_start = self.get_week_start(datetime.now())
-
-        # ===== ROLE-BASED ACCESS CONTROL =====
-        self.current_user_role = None
-        self.user_name = None
-
-        # Team members as specified
-        self.technicians = [
-            "Mark Michaels", "Jerone Bosarge", "Jon Hymel", "Nick Whisenant", 
-            "James Dunnam", "Wayne Dunnam", "Nate Williams", "Rey Marikit", "Ronald Houghs",
-        ]
-
-        # Show login dialog
-        if not self.show_login_dialog():
-            self.root.destroy()
-            return
-
-        # Apply modern styling BEFORE creating GUI
-        self.apply_modern_theme()
-
-        # Create modern GUI based on user role
-        self.create_modern_gui()
-
+    
+        # Create GUI based on user role
+        self.create_gui()
+    
         # Load initial data
         self.load_equipment_data()
-
-        # Add modern features
+        self.check_empty_database_and_offer_restore()
+    
+        # Add this near the end of __init__, after self.load_equipment_data()
         if self.current_user_role == 'Manager':
             self.add_backup_button_to_equipment_tab()
+            self.add_database_restore_button()  
+        if self.current_user_role == 'Manager':
             self.update_equipment_statistics()
-            self.root.after(1000, self.update_dashboard_cards) 
+    
+        print(f"✅ AIT Complete CMMS System initialized successfully for {self.user_name} ({self.current_user_role})")
 
+       
+    
+        # Add this at the very end of __init__:
+    
         # Set up window close handler
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-
-        print(f"AIT Modern CMMS System initialized successfully for {self.user_name} ({self.current_user_role})")
-
-    def setup_root_window(self):
-        """Configure the root window with modern styling"""
-        self.root.title("AIT CMMS")
-        self.root.geometry("1600x900")
     
-        # Configure for modern appearance
-        self.root.configure(bg=ModernCMMSStyles.LIGHT)
+        print(f"AIT Complete CMMS System initialized successfully for {self.user_name} ({self.current_user_role})")
+
+
     
+    def sync_database_before_init(self):
+        """Download and sync with latest database backup BEFORE initializing local database"""
         try:
-            self.root.state('zoomed')  # Maximize on Windows
-        except:
-            pass
-
-    def apply_modern_theme(self):
-        """Apply modern theme to ttk widgets"""
-        style = ttk.Style()
-        style.theme_use('clam')
+            if not hasattr(self, 'backup_sync_dir') or not self.backup_sync_dir:
+                print("No backup directory configured, skipping pre-init sync")
+                return False
+        
+            backup_dir = self.backup_sync_dir
+            local_db = 'ait_cmms_database.db'
     
-        # Configure notebook (tabs)
-        style.configure("Modern.TNotebook",
-                       background=ModernCMMSStyles.LIGHT,
-                       borderwidth=0)
+            print("Checking for latest database backup before initialization...")
     
-        style.configure("Modern.TNotebook.Tab",
-                       background=ModernCMMSStyles.WHITE,
-                       foreground=ModernCMMSStyles.DARK,
-                       padding=[20, 10],
-                       font=ModernCMMSStyles.BODY_FONT)
+            # Get all backup files from SharePoint folder
+            if not os.path.exists(backup_dir):
+                print("SharePoint backup folder not found, skipping sync")
+                return False
+        
+            backup_files = []
+            for f in os.listdir(backup_dir):
+                if f.startswith('ait_cmms_backup_') and f.endswith('.db'):
+                    full_path = os.path.join(backup_dir, f)
+                    backup_files.append((full_path, os.path.getmtime(full_path)))
     
-        style.map("Modern.TNotebook.Tab",
-                background=[('selected', ModernCMMSStyles.PRIMARY),
-                        ('active', ModernCMMSStyles.INFO)],
-                foreground=[('selected', 'white'),
-                        ('active', 'white')])
+            if not backup_files:
+                print("No backup files found in SharePoint, will start with empty database")
+                return False
+        
+            # Find the most recent backup
+            backup_files.sort(key=lambda x: x[1], reverse=True)
+            latest_backup_path, latest_backup_time = backup_files[0]
     
-        # Configure frames
-        style.configure("Modern.TFrame",
-                       background=ModernCMMSStyles.WHITE,
-                       relief="flat",
-                       borderwidth=1)
+            # Check if local database exists and compare
+            if os.path.exists(local_db):
+                local_db_time = os.path.getmtime(local_db)
+                local_db_size = os.path.getsize(local_db)
+            
+                # If SharePoint backup is newer OR if local database is empty, replace it
+                if latest_backup_time > local_db_time or local_db_size < 10000:  # 10KB threshold for "empty"
+                    print(f"SharePoint backup is newer or local database is empty, syncing...")
+                    print(f"Latest backup: {os.path.basename(latest_backup_path)}")
+                
+                    # MODIFIED: Only create ONE local backup, overwrite if exists
+                    if local_db_size > 10000:  # Only backup if local has meaningful content
+                        local_backup_name = "ait_cmms_database_local_backup.db"
+                        if os.path.exists(local_backup_name):
+                            print(f"Overwriting existing local backup: {local_backup_name}")
+                        else:
+                            print(f"Creating local backup: {local_backup_name}")
+                        shutil.copy2(local_db, local_backup_name)
+                
+                    # Copy SharePoint backup to local database
+                    shutil.copy2(latest_backup_path, local_db)
+                
+                    print(f"Database synced successfully from SharePoint")
+                    return True
+                else:
+                    print("Local database is current and has content, no sync needed")
+                    return False
+            else:
+                # No local database exists, copy the latest backup
+                print(f"No local database found, copying latest backup: {os.path.basename(latest_backup_path)}")
+                shutil.copy2(latest_backup_path, local_db)
+                print(f"Database initialized from SharePoint backup")
+                return True
+        
+        except Exception as e:
+            print(f"Error in pre-init database sync: {e}")
+            return False
     
-        # Configure labels
-        style.configure("Heading.TLabel",
-                       background=ModernCMMSStyles.WHITE,
-                       foreground=ModernCMMSStyles.PRIMARY,
-                       font=ModernCMMSStyles.HEADER_FONT)
     
-        style.configure("Subheading.TLabel",
-                       background=ModernCMMSStyles.WHITE,
-                       foreground=ModernCMMSStyles.DARK,
-                       font=ModernCMMSStyles.SUBHEADER_FONT)
-
-
-
-
+    
     def show_login_dialog(self):
         """Show login dialog to determine user role with password protection for manager"""
-        login_dialog = tk.Toplevel(self.root)
-        login_dialog.title("AIT CMMS - User Login")
-        login_dialog.geometry("450x350")  # Made taller for password field
-        login_dialog.transient(self.root)
-        login_dialog.grab_set()
-    
-        # Center the dialog
-        login_dialog.update_idletasks()
-        x = (login_dialog.winfo_screenwidth() // 2) - (login_dialog.winfo_width() // 2)
-        y = (login_dialog.winfo_screenheight() // 2) - (login_dialog.winfo_height() // 2)
-        login_dialog.geometry(f"+{x}+{y}")
-    
-        # Prevent closing the dialog with X button
-        login_dialog.protocol("WM_DELETE_WINDOW", lambda: None)
-    
-        # Header
-        header_frame = ttk.Frame(login_dialog)
-        header_frame.pack(fill='x', padx=20, pady=20)
-    
-        ttk.Label(header_frame, text="AIT CMMS LOGIN", 
-                font=('Arial', 16, 'bold')).pack()
-        ttk.Label(header_frame, text="Select your role to continue", 
-                font=('Arial', 10)).pack(pady=5)
-    
-        # User selection
-        user_frame = ttk.LabelFrame(login_dialog, text="Select User", padding=15)
-        user_frame.pack(fill='x', padx=20, pady=10)
-    
-        self.selected_user = tk.StringVar()
-    
-        # Manager option with password requirement
-        manager_frame = ttk.Frame(user_frame)
-        manager_frame.pack(fill='x', pady=5)
-    
-        ttk.Radiobutton(manager_frame, text="Manager (Full Access)", 
-                    variable=self.selected_user, value="Manager").pack(side='left')
-        ttk.Label(manager_frame, text="- Access to all CMMS functions (Password Required)", 
-                font=('Arial', 9), foreground='blue').pack(side='left', padx=10)
-    
-        # Password field for manager (initially hidden)
-        password_frame = ttk.Frame(user_frame)
-        password_frame.pack(fill='x', pady=10)
-    
-        ttk.Label(password_frame, text="Manager Password:", font=('Arial', 10, 'bold')).pack(anchor='w')
-        password_var = tk.StringVar()
-        password_entry = ttk.Entry(password_frame, textvariable=password_var, show="*", width=20)
-        password_entry.pack(anchor='w', pady=2)
-    
-        # Initially hide password field
-        password_frame.pack_forget()
-    
-        # Separator
-        ttk.Separator(user_frame, orient='horizontal').pack(fill='x', pady=10)
-    
-        # Technician options
-        ttk.Label(user_frame, text="Technicians (CM Access Only):", 
-                font=('Arial', 10, 'bold')).pack(anchor='w', pady=(0,5))
-    
-        # Create technician radio buttons in two columns
-        tech_frame = ttk.Frame(user_frame)
-        tech_frame.pack(fill='x')
-    
-        left_column = ttk.Frame(tech_frame)
-        left_column.pack(side='left', fill='both', expand=True)
-    
-        right_column = ttk.Frame(tech_frame)
-        right_column.pack(side='right', fill='both', expand=True)
-    
-        for i, tech in enumerate(self.technicians):
-            column = left_column if i < len(self.technicians)//2 else right_column
-            ttk.Radiobutton(column, text=tech, 
-                        variable=self.selected_user, value=tech).pack(anchor='w', pady=1)
-    
-        def on_user_selection_change(*args):
-            """Show/hide password field based on selection"""
-            if self.selected_user.get() == "Manager":
-                password_frame.pack(fill='x', pady=10, after=manager_frame)
-                password_entry.focus_set()  # Focus on password field
-            else:
-                password_frame.pack_forget()
-    
-        # Bind to user selection changes
-        self.selected_user.trace('w', on_user_selection_change)
-    
-        # Login result
+        # Ensure we start fresh
         login_successful = False
     
-        def do_login():
+        def create_login_dialog():
             nonlocal login_successful
-            user = self.selected_user.get()
-        
-            if not user:
-                messagebox.showerror("Error", "Please select a user")
-                return
-        
-            # Handle manager login with password
-            if user == "Manager":
-                entered_password = password_var.get()
-                correct_password = "AIT2584"
             
-                if not entered_password:
-                    messagebox.showerror("Error", "Please enter the manager password")
+            login_dialog = tk.Toplevel(self.root)
+            login_dialog.title("AIT CMMS - User Login")
+            login_dialog.geometry("450x350")
+            login_dialog.transient(self.root)
+            login_dialog.grab_set()
+
+            # Center the dialog
+            login_dialog.update_idletasks()
+            x = (login_dialog.winfo_screenwidth() // 2) - (login_dialog.winfo_width() // 2)
+            y = (login_dialog.winfo_screenheight() // 2) - (login_dialog.winfo_height() // 2)
+            login_dialog.geometry(f"+{x}+{y}")
+
+            # Prevent closing the dialog with X button
+            login_dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+            # Header
+            header_frame = ttk.Frame(login_dialog)
+            header_frame.pack(fill='x', padx=20, pady=20)
+
+            ttk.Label(header_frame, text="AIT CMMS LOGIN", 
+                    font=('Arial', 16, 'bold')).pack()
+            ttk.Label(header_frame, text="Select your role to continue", 
+                    font=('Arial', 10)).pack(pady=5)
+
+            # User selection
+            user_frame = ttk.LabelFrame(login_dialog, text="Select User", padding=15)
+            user_frame.pack(fill='x', padx=20, pady=10)
+
+            selected_user = tk.StringVar()
+
+            # Manager option with password requirement
+            manager_frame = ttk.Frame(user_frame)
+            manager_frame.pack(fill='x', pady=5)
+
+            ttk.Radiobutton(manager_frame, text="Manager (Full Access)", 
+                        variable=selected_user, value="Manager").pack(side='left')
+            ttk.Label(manager_frame, text="- Access to all CMMS functions (Password Required)", 
+                    font=('Arial', 9), foreground='blue').pack(side='left', padx=10)
+
+            # Password field for manager (initially hidden)
+            password_frame = ttk.Frame(user_frame)
+            password_frame.pack(fill='x', pady=10)
+
+            ttk.Label(password_frame, text="Manager Password:", font=('Arial', 10, 'bold')).pack(anchor='w')
+            password_var = tk.StringVar()
+            password_entry = ttk.Entry(password_frame, textvariable=password_var, show="*", width=20)
+            password_entry.pack(anchor='w', pady=2)
+
+            # Initially hide password field
+            password_frame.pack_forget()
+
+            # Separator
+            ttk.Separator(user_frame, orient='horizontal').pack(fill='x', pady=10)
+
+            # Technician options
+            ttk.Label(user_frame, text="Technicians (CM Access Only):", 
+                    font=('Arial', 10, 'bold')).pack(anchor='w', pady=(0,5))
+
+            # Create technician radio buttons in two columns
+            tech_frame = ttk.Frame(user_frame)
+            tech_frame.pack(fill='x')
+
+            left_column = ttk.Frame(tech_frame)
+            left_column.pack(side='left', fill='both', expand=True)
+
+            right_column = ttk.Frame(tech_frame)
+            right_column.pack(side='right', fill='both', expand=True)
+
+            for i, tech in enumerate(self.technicians):
+                column = left_column if i < len(self.technicians)//2 else right_column
+                ttk.Radiobutton(column, text=tech, 
+                            variable=selected_user, value=tech).pack(anchor='w', pady=1)
+
+            def on_user_selection_change(*args):
+                """Show/hide password field based on selection"""
+                if selected_user.get() == "Manager":
+                    password_frame.pack(fill='x', pady=10, after=manager_frame)
                     password_entry.focus_set()
+                else:
+                    password_frame.pack_forget()
+
+            # Bind to user selection changes
+            selected_user.trace('w', on_user_selection_change)
+
+            # Track if login is in progress to prevent double-execution
+            login_in_progress = False
+
+            def do_login():
+                nonlocal login_successful, login_in_progress
+            
+                if login_in_progress:
                     return
             
-                if entered_password != correct_password:
-                    messagebox.showerror("Access Denied", 
-                                    "Incorrect manager password.\n\n"
-                                    "Access to manager functions is restricted.")
-                    password_var.set("")  # Clear the password field
-                    password_entry.focus_set()
-                    return
+                login_in_progress = True
             
-                # Password correct
-                self.current_user_role = "Manager"
-                self.user_name = "Manager"
-            
-            else:
-                # Technician login (no password required)
-                self.current_user_role = "Technician"
-                self.user_name = user
-        
-            login_successful = True
-            login_dialog.destroy()
-    
-        def cancel_login():
-            nonlocal login_successful
-            login_successful = False
-            login_dialog.destroy()
-    
-        # Buttons
-        button_frame = ttk.Frame(login_dialog)
-        button_frame.pack(side='bottom', fill='x', padx=20, pady=20)
-    
-        login_button = ttk.Button(button_frame, text="Login", command=do_login)
-        login_button.pack(side='left', padx=5)
-        ttk.Button(button_frame, text="Exit", command=cancel_login).pack(side='right', padx=5)
-    
-        # Allow Enter key to submit login
-        def on_enter_key(event):
-            do_login()
-    
-        login_dialog.bind('<Return>', on_enter_key)
-        password_entry.bind('<Return>', on_enter_key)
-    
-        # Wait for dialog to close
-        self.root.wait_window(login_dialog)
+                try:
+                    user = selected_user.get()
+
+                    if not user:
+                        messagebox.showerror("Error", "Please select a user")
+                        return
+
+                    # Handle manager login with password
+                    if user == "Manager":
+                        entered_password = password_var.get()
+                        correct_password = "AIT2584"
+
+                        if not entered_password:
+                            messagebox.showerror("Error", "Please enter the manager password")
+                            password_entry.focus_set()
+                            return
+
+                        if entered_password != correct_password:
+                            messagebox.showerror("Access Denied", 
+                                            "Incorrect manager password.\n\n"
+                                            "Access to manager functions is restricted.")
+                            password_var.set("")
+                            password_entry.focus_set()
+                            return
+
+                        # Password correct
+                        self.current_user_role = "Manager"
+                        self.user_name = "Manager"
+
+                    else:
+                        # Technician login (no password required)
+                        self.current_user_role = "Technician"
+                        self.user_name = user
+
+                    login_successful = True
+                    dialog.quit()
+                
+                finally:
+                    login_in_progress = False
+
+            def cancel_login():
+                nonlocal login_successful
+                login_successful = False
+                dialog.quit()
+
+            # Buttons
+            button_frame = ttk.Frame(login_dialog)
+            button_frame.pack(side='bottom', fill='x', padx=20, pady=20)
+
+            login_button = ttk.Button(button_frame, text="Login", command=do_login)
+            login_button.pack(side='left', padx=5)
+            ttk.Button(button_frame, text="Exit", command=cancel_login).pack(side='right', padx=5)
+
+            # Simplified event binding
+            def on_enter_key(event):
+                if not login_in_progress:
+                    do_login()
+
+            # Only bind to password entry
+            password_entry.bind('<Return>', on_enter_key)
+
+            return login_dialog
+
+        # Create and run the dialog
+        dialog = create_login_dialog()
+        dialog.mainloop()
+        dialog.destroy()
     
         return login_successful
+
+    
 
     
     def get_week_start(self, date):
@@ -5398,182 +4091,36 @@ class AITCMMSSystem:
         
         self.conn.commit()
     
+    def create_gui(self):
+        """Create the main GUI interface based on user role"""
+        # Create style
+        style = ttk.Style()
+        style.theme_use('clam')
     
-    def create_modern_gui(self):
-        """Create the modern GUI interface"""
-        # Create main container
-        main_container = ttk.Frame(self.root, style="Modern.TFrame")
-        main_container.pack(fill='both', expand=True, padx=10, pady=10)
-        
-        # Header section
-        self.create_header(main_container)
-        
-        # Dashboard section (only for managers)
-        if self.current_user_role == 'Manager':
-            self.create_dashboard(main_container)
-    
-        # Main content area with tabs
-        self.create_main_content(main_container)
-    
-        # Status bar
-        self.create_status_bar()
-
-    
-    def create_header(self, parent):
-        """Create compact header section with only AIT logo"""
-        header_frame = ttk.Frame(parent, style="Modern.TFrame", padding=(20, 10, 20, 5))  # Reduced vertical padding
-        header_frame.pack(fill='x')
-
-        # Create a frame that uses minimal space
-        content_frame = ttk.Frame(header_frame)
-        content_frame.pack(fill='x')
-
-        # Logo - smaller and left-aligned
-        logo_frame = ttk.Frame(content_frame)
-        logo_frame.pack(side='left', padx=(0, 10))
-
-        try:
-            from PIL import Image, ImageTk
-        
-            logo_path = r"C:\Users\stu15olen\Desktop\AIT_CMMS\img\ait_Logo.png"
-            if os.path.exists(logo_path):
-                pil_image = Image.open(logo_path)
-                # Smaller logo size
-                pil_image = pil_image.resize((300, 90), Image.Resampling.LANCZOS)
-                logo_image = ImageTk.PhotoImage(pil_image)
-                
-                logo_label = ttk.Label(logo_frame, image=logo_image)
-                logo_label.image = logo_image
-                logo_label.pack()
-            else:
-                print(f"Logo file not found: {logo_path}")
-                fallback_label = ttk.Label(logo_frame, text="AIT", 
-                                        font=("Segoe UI", 24, "bold"),
-                                        foreground=ModernCMMSStyles.PRIMARY)
-                fallback_label.pack()
-            
-        except Exception as e:
-            print(f"Error loading logo: {e}")
-            fallback_label = ttk.Label(logo_frame, text="AIT", 
-                                    font=("Segoe UI", 24, "bold"),
-                                    foreground=ModernCMMSStyles.PRIMARY)
-            fallback_label.pack()
-
-        # User info - right aligned, compact
-        user_frame = ttk.Frame(content_frame)
-        user_frame.pack(side='right')
-
-        user_label = ttk.Label(user_frame,
-                              text=f"{self.user_name} ({self.current_user_role})",
-                              font=("Segoe UI", 9),
-                              foreground="gray")
-        user_label.pack(anchor='e')
-    
-    
-    
-    
-    
-
-    def create_dashboard(self, parent):
-        """Create modern dashboard with status cards"""
-        dashboard_frame = ModernFrame(parent, title="System Overview")
-        dashboard_frame.pack(fill='x', pady=(0, 20))
-        dashboard_frame.configure(relief="solid", borderwidth=2)
-        
-        # Status cards container
-        cards_frame = ttk.Frame(dashboard_frame)
-        cards_frame.pack(fill='x', padx=20, pady=5)
-        
-        # Create status cards
-        self.total_equipment_card = StatusCard(cards_frame, 
-                                            "Total Equipment", 
-                                            "0", 
-                                            ModernCMMSStyles.PRIMARY)
-        self.total_equipment_card.pack(side='left', fill='both', expand=True)
-    
-        self.active_equipment_card = StatusCard(cards_frame,
-                                            "Active Equipment",
-                                            "0",
-                                            ModernCMMSStyles.SUCCESS)
-        self.active_equipment_card.pack(side='left', fill='both', expand=True)
-    
-        self.missing_equipment_card = StatusCard(cards_frame,
-                                                "Cannot Find",
-                                                "0",
-                                                ModernCMMSStyles.MISSING_COLOR)
-        self.missing_equipment_card.pack(side='left', fill='both', expand=True)
-    
-        self.rtf_equipment_card = StatusCard(cards_frame,
-                                           "Run to Failure",
-                                           "0",
-                                           ModernCMMSStyles.WARNING)
-        self.rtf_equipment_card.pack(side='left', fill='both', expand=True)
-    
-        self.recent_pms_card = StatusCard(cards_frame,
-                                        "Recent PMs (30d)",
-                                        "0",
-                                        ModernCMMSStyles.INFO)
-        self.recent_pms_card.pack(side='left', fill='both', expand=True)
-
-    def create_main_content(self, parent):
-        """Create main content area with modern tabs"""
-        # Content frame
-        content_frame = ttk.Frame(parent, style="Modern.TFrame")
-        content_frame.pack(fill='both', expand=True)
-        
-        # Create notebook for tabs
-        self.notebook = ttk.Notebook(content_frame, style="Modern.TNotebook")
+        # Main notebook for tabs
+        self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
     
-        # Create tabs based on user role
+        # Create tabs based on role
         if self.current_user_role == 'Manager':
-            self.create_equipment_tab_modern()
-            self.create_pm_scheduling_tab_modern()
-            self.create_pm_completion_tab_modern()
-            self.create_cm_management_tab_modern()
-            self.create_analytics_tab_modern()
-            self.create_cannot_find_tab()
-            self.create_run_to_failure_tab()
-            self.create_pm_history_search_tab()
-            self.create_custom_pm_templates_tab()
+            # Manager gets all tabs
+            self.create_all_manager_tabs()
         else:
-            self.create_cm_management_tab_modern()
-            self.create_technician_info_tab()
-
-    def create_status_bar(self):
-        """Create modern status bar"""
-        status_frame = ttk.Frame(self.root, style="Modern.TFrame", padding=(10, 5))
+            # Technicians only get CM tab
+            self.create_technician_tabs()
+    
+        # Status bar with user info
+        status_frame = ttk.Frame(self.root)
         status_frame.pack(side='bottom', fill='x')
     
-        # Status indicator
-        status_indicator = ttk.Frame(status_frame)
-        status_indicator.pack(side='left')
-        
-        # Green dot for system status
-        status_dot = tk.Canvas(status_indicator, width=12, height=12, bg=ModernCMMSStyles.WHITE, highlightthickness=0)
-        status_dot.create_oval(2, 2, 10, 10, fill=ModernCMMSStyles.SUCCESS, outline="")
-        status_dot.pack(side='left', padx=(0, 5))
+        self.status_bar = ttk.Label(status_frame, text=f"AIT CMMS Ready - Logged in as: {self.user_name} ({self.current_user_role})", 
+                                    relief='sunken')
+        self.status_bar.pack(side='left', fill='x', expand=True)
     
-        # Status text
-        self.status_label = ttk.Label(status_indicator,
-                                    text="System Ready",
-                                    font=ModernCMMSStyles.SMALL_FONT,
-                                    foreground=ModernCMMSStyles.DARK,
-                                    background=ModernCMMSStyles.WHITE)
-        self.status_label.pack(side='left')
-    
-        # Version info
-        version_label = ttk.Label(status_frame,
-                                text="AIT Modern CMMS v2.0",
-                                font=ModernCMMSStyles.SMALL_FONT,
-                                foreground=ModernCMMSStyles.DARK,
-                                background=ModernCMMSStyles.WHITE)
-        version_label.pack(side='right')
-    
-    
-    
-    
-    
+        # Role switching button (only for development/testing)
+        if self.current_user_role == 'Manager':
+            ttk.Button(status_frame, text="Switch to Technician View", 
+                    command=self.switch_to_technician_view).pack(side='right', padx=5)
 
     def create_all_manager_tabs(self):
         """Create all tabs for manager access"""
@@ -5830,96 +4377,89 @@ class AITCMMSSystem:
     
     
 
-    def create_equipment_tab_modern(self):
-        """Create modern equipment management tab"""
-        self.equipment_frame = ttk.Frame(self.notebook, style="Modern.TFrame")
+    def create_equipment_tab(self):
+        """Equipment management and data import tab"""
+        self.equipment_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.equipment_frame, text="Equipment Management")
         
-        # Controls section
-        controls_frame = ModernFrame(self.equipment_frame, title="Equipment Controls")
-        controls_frame.pack(fill='x', padx=20, pady=10)
-    
-        # Control buttons
-        buttons_frame = ttk.Frame(controls_frame, padding=10)
-        buttons_frame.pack(fill='x')
-    
-        # Use the modern button class (we'll create a simplified version)
-        ttk.Button(buttons_frame, text="Import CSV", 
-                command=self.import_equipment_csv,
-                style="Primary.TButton").pack(side='left', padx=5)
-        ttk.Button(buttons_frame, text="Add Equipment", 
-                command=self.add_equipment_dialog,
-                style="Success.TButton").pack(side='left', padx=5)
-        ttk.Button(buttons_frame, text="Edit Equipment", 
-                command=self.edit_equipment_dialog,
-                style="Warning.TButton").pack(side='left', padx=5)
-        ttk.Button(buttons_frame, text="Export List", 
-                command=self.export_equipment_list,
-                style="Primary.TButton").pack(side='left', padx=5)
-        ttk.Button(buttons_frame, text="Refresh", 
-                command=self.refresh_equipment_list,
-                style="Primary.TButton").pack(side='left', padx=5)
-        ttk.Button(buttons_frame, text="Restore From Backup", 
-                command=self.restore_from_backup_dialog,
-                style="Warning.TButton").pack(side='left', padx=5)        
+        # Controls frame
+        controls_frame = ttk.LabelFrame(self.equipment_frame, text="Equipment Controls", padding=10)
+        controls_frame.pack(fill='x', padx=10, pady=5)
         
-    
-        # Search section
-        search_frame = ttk.Frame(controls_frame, padding=(10, 5))
-        search_frame.pack(fill='x')
-    
-        ttk.Label(search_frame, 
-                 text="Search Equipment:", 
-                 font=ModernCMMSStyles.BODY_FONT).pack(side='left', padx=5)
-    
+        # Add statistics frame after controls_frame
+        stats_frame = ttk.LabelFrame(self.equipment_frame, text="Equipment Statistics", padding=10)
+        stats_frame.pack(fill='x', padx=10, pady=5)
+
+        # Statistics labels
+        self.stats_total_label = ttk.Label(stats_frame, text="Total Assets: 0", font=('Arial', 10, 'bold'))
+        self.stats_total_label.pack(side='left', padx=20)
+
+        self.stats_cf_label = ttk.Label(stats_frame, text="Cannot Find: 0", font=('Arial', 10, 'bold'), foreground='red')
+        self.stats_cf_label.pack(side='left', padx=20)
+
+        self.stats_rtf_label = ttk.Label(stats_frame, text="Run to Failure: 0", font=('Arial', 10, 'bold'), foreground='orange')
+        self.stats_rtf_label.pack(side='left', padx=20)
+
+        self.stats_active_label = ttk.Label(stats_frame, text="Active Assets: 0", font=('Arial', 10, 'bold'), foreground='green')
+        self.stats_active_label.pack(side='left', padx=20)
+
+        # Refresh stats button
+        ttk.Button(stats_frame, text="Refresh Stats", 
+                command=self.update_equipment_statistics).pack(side='right', padx=5)
+        
+        
+        ttk.Button(controls_frame, text="Import Equipment CSV", 
+                  command=self.import_equipment_csv).pack(side='left', padx=5)
+        ttk.Button(controls_frame, text="Add Equipment", 
+                  command=self.add_equipment_dialog).pack(side='left', padx=5)
+        ttk.Button(controls_frame, text="Edit Equipment", 
+                  command=self.edit_equipment_dialog).pack(side='left', padx=5)
+        ttk.Button(controls_frame, text="Refresh List", 
+                  command=self.refresh_equipment_list).pack(side='left', padx=5)
+        ttk.Button(controls_frame, text="Export Equipment", 
+                  command=self.export_equipment_list).pack(side='left', padx=5)
+        
+        
+        
+        # Search frame
+        search_frame = ttk.Frame(self.equipment_frame)
+        search_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Label(search_frame, text="Search Equipment:").pack(side='left', padx=5)
         self.equipment_search_var = tk.StringVar()
-        search_entry = ttk.Entry(search_frame, 
-                               textvariable=self.equipment_search_var, 
-                               width=30,
-                               font=ModernCMMSStyles.BODY_FONT)
+        self.equipment_search_var.trace('w', self.filter_equipment_list)
+        search_entry = ttk.Entry(search_frame, textvariable=self.equipment_search_var, width=30)
         search_entry.pack(side='left', padx=5)
         
-        self.equipment_search_var.trace('w', self.filter_equipment_list)
-    
-        # Equipment list section
-        list_frame = ModernFrame(self.equipment_frame, title="Equipment List")
-        list_frame.pack(fill='both', expand=True, padx=20, pady=10)
-    
-        # Create modern treeview for equipment
-        tree_container = ttk.Frame(list_frame, padding=10)
-        tree_container.pack(fill='both', expand=True)
-      
-    
-        # Equipment treeview with color coding - USE ModernTreeview
-        columns = ('SAP', 'BFM', 'Description', 'Location', 'Monthly PM', 'Annual PM', 'Status')
-        self.equipment_tree = ModernTreeview(tree_container, 
-                                           columns=columns,
-                                           show='headings tree',
-                                           height=15)
-        # Add this line after creating the treeview to show grid lines
-        self.equipment_tree.configure(show='headings')  # Keep just headings
+        # Equipment list
+        list_frame = ttk.Frame(self.equipment_frame)
+        list_frame.pack(fill='both', expand=True, padx=10, pady=5)
         
-        
-        
+        # Treeview with scrollbars
+        self.equipment_tree = ttk.Treeview(list_frame, 
+                                         columns=('SAP', 'BFM', 'Description', 'Location', 'LIN', 'Monthly', 'Six Month', 'Annual', 'Status'),
+                                         show='headings', height=20)
         
         # Configure columns
-        column_configs = {
+        columns_config = {
             'SAP': ('SAP Material No.', 120),
-            'BFM': ('BFM Equipment No.', 140),
+            'BFM': ('BFM Equipment No.', 130),
             'Description': ('Description', 300),
-            'Location': ('Location', 150),
-            'Monthly PM': ('Monthly PM', 100),
-            'Annual PM': ('Annual PM', 100),
-            'Status': ('Status', 120)
+            'Location': ('Location', 100),
+            'LIN': ('Master LIN', 80),
+            'Monthly': ('Monthly PM', 80),
+            'Six Month': ('6-Month PM', 80),
+            'Annual': ('Annual PM', 80),
+            'Status': ('Status', 80)
         }
-    
-        for col, (heading, width) in column_configs.items():
+        
+        for col, (heading, width) in columns_config.items():
             self.equipment_tree.heading(col, text=heading)
             self.equipment_tree.column(col, width=width)
-    
+        
         # Scrollbars
-        v_scrollbar = ttk.Scrollbar(tree_container, orient='vertical', command=self.equipment_tree.yview)
-        h_scrollbar = ttk.Scrollbar(tree_container, orient='horizontal', command=self.equipment_tree.xview)
+        v_scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.equipment_tree.yview)
+        h_scrollbar = ttk.Scrollbar(list_frame, orient='horizontal', command=self.equipment_tree.xview)
         self.equipment_tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
         
         # Pack treeview and scrollbars
@@ -5927,160 +4467,31 @@ class AITCMMSSystem:
         v_scrollbar.grid(row=0, column=1, sticky='ns')
         h_scrollbar.grid(row=1, column=0, sticky='ew')
         
-        tree_container.grid_rowconfigure(0, weight=1)
-        tree_container.grid_columnconfigure(0, weight=1)
-
-    
-    def create_pm_completion_tab_modern(self):
-        """Create modern PM completion tab"""
-        self.pm_completion_frame = ttk.Frame(self.notebook, style="Modern.TFrame")
-        self.notebook.add(self.pm_completion_frame, text="PM Completion")
-        
-        # Main container with side-by-side layout
-        main_container = ttk.Frame(self.pm_completion_frame)
-        main_container.pack(fill='both', expand=True, padx=20, pady=10)
-        
-        # LEFT SIDE: Form
-        form_frame = ModernFrame(main_container, title="PM Completion Entry")
-        form_frame.pack(side='left', fill='y', padx=(0, 10))
-        
-        # Form container - make it more compact
-        form_container = ttk.Frame(form_frame, padding=15)
-        form_container.pack(fill='x')
-        
-        # Row 0: Equipment Number and PM Type
-        ttk.Label(form_container, text="Equipment Number:", font=ModernCMMSStyles.BODY_FONT).grid(row=0, column=0, sticky='w', padx=5, pady=3)
-        self.completion_bfm_var = tk.StringVar()
-        self.bfm_combo = ttk.Combobox(form_container, textvariable=self.completion_bfm_var, width=18)
-        self.bfm_combo.grid(row=0, column=1, sticky='w', padx=5, pady=3)
-        self.bfm_combo.bind('<KeyRelease>', self.update_equipment_suggestions)
-    
-        ttk.Label(form_container, text="PM Type:", font=ModernCMMSStyles.BODY_FONT).grid(row=1, column=0, sticky='w', padx=5, pady=3)
-        self.pm_type_var = tk.StringVar()
-        pm_type_combo = ttk.Combobox(form_container, textvariable=self.pm_type_var, 
-                                values=['Monthly', 'Annual', 'CANNOT FIND', 'Run to Failure'], 
-                                width=18, state='readonly')
-        pm_type_combo.grid(row=1, column=1, sticky='w', padx=5, pady=3)
-
-        # Row 2: Technician and Completion Date
-        ttk.Label(form_container, text="Technician:", font=ModernCMMSStyles.BODY_FONT).grid(row=2, column=0, sticky='w', padx=5, pady=3)
-        self.completion_tech_var = tk.StringVar()
-        tech_combo = ttk.Combobox(form_container, textvariable=self.completion_tech_var, 
-                                values=self.technicians, width=18, state='readonly')
-        tech_combo.grid(row=2, column=1, sticky='w', padx=5, pady=3)
-
-        ttk.Label(form_container, text="Completion Date:", font=ModernCMMSStyles.BODY_FONT).grid(row=3, column=0, sticky='w', padx=5, pady=3)
-        self.completion_date_var = tk.StringVar(value=datetime.now().strftime('%Y-%m-%d'))
-        ttk.Entry(form_container, textvariable=self.completion_date_var, width=18).grid(row=3, column=1, sticky='w', padx=5, pady=3)
-
-        # Row 4: Labor time
-        ttk.Label(form_container, text="Labor Time:", font=ModernCMMSStyles.BODY_FONT).grid(row=4, column=0, sticky='w', padx=5, pady=3)
-        time_frame = ttk.Frame(form_container)
-        time_frame.grid(row=4, column=1, sticky='w', padx=5, pady=3)
-
-        self.labor_hours_var = tk.StringVar(value="0")
-        ttk.Entry(time_frame, textvariable=self.labor_hours_var, width=4).pack(side='left')
-        ttk.Label(time_frame, text="h").pack(side='left', padx=2)
-        
-        self.labor_minutes_var = tk.StringVar(value="0")
-        ttk.Entry(time_frame, textvariable=self.labor_minutes_var, width=4).pack(side='left')
-        ttk.Label(time_frame, text="m").pack(side='left', padx=2)
-        
-        # RIGHT SIDE: Additional fields and buttons
-        right_frame = ttk.Frame(form_container)
-        right_frame.grid(row=0, column=2, rowspan=8, sticky='nw', padx=20, pady=0)
-        
-        # Special Equipment
-        ttk.Label(right_frame, text="Special Equipment:", font=ModernCMMSStyles.BODY_FONT).grid(row=0, column=0, sticky='w', pady=3)
-        self.special_equipment_var = tk.StringVar()
-        ttk.Entry(right_frame, textvariable=self.special_equipment_var, width=25).grid(row=0, column=1, sticky='w', padx=5, pady=3)
-        
-        # Next Annual PM Date
-        ttk.Label(right_frame, text="Next Annual PM:", font=ModernCMMSStyles.BODY_FONT).grid(row=1, column=0, sticky='w', pady=3)
-        self.next_annual_pm_var = tk.StringVar()
-        ttk.Entry(right_frame, textvariable=self.next_annual_pm_var, width=25).grid(row=1, column=1, sticky='w', padx=5, pady=3)
-    
-        # Notes
-        ttk.Label(right_frame, text="Notes:", font=ModernCMMSStyles.BODY_FONT).grid(row=2, column=0, sticky='nw', pady=3)
-        self.notes_text = tk.Text(right_frame, width=25, height=4)
-        self.notes_text.grid(row=2, column=1, sticky='w', padx=5, pady=3)
-
-        # Buttons
-        button_frame = ttk.Frame(right_frame)
-        button_frame.grid(row=3, column=0, columnspan=2, pady=15, sticky='w')
-
-        ttk.Button(button_frame, text="Submit Completion", 
-                command=self.submit_pm_completion,
-                style="Success.TButton").pack(pady=2, fill='x')
-        ttk.Button(button_frame, text="Clear Form", 
-                command=self.clear_completion_form,
-                style="Warning.TButton").pack(pady=2, fill='x')
-        ttk.Button(button_frame, text="View History", 
-                command=self.show_equipment_pm_history_dialog,
-                style="Primary.TButton").pack(pady=2, fill='x')
-
-        # RIGHT SIDE: Recent completions section
-        recent_frame = ModernFrame(main_container, title="Recent Completions")
-        recent_frame.pack(side='right', fill='both', expand=True)
-
-        recent_container = ttk.Frame(recent_frame, padding=10)
-        recent_container.pack(fill='both', expand=True)
-
-        self.recent_completions_tree = ModernTreeview(recent_container,
-                                                    columns=('Date', 'Equipment', 'PM Type', 'Technician', 'Status'),
-                                                    show='headings',
-                                                    height=20)  # More height for better display
-
-        recent_columns = {
-            'Date': ('Completion Date', 120),
-            'Equipment': ('Equipment', 150),
-            'PM Type': ('PM Type', 100),
-            'Technician': ('Technician', 150),
-            'Status': ('Status', 100)
-        }
-
-        for col, (heading, width) in recent_columns.items():
-            self.recent_completions_tree.heading(col, text=heading)
-            self.recent_completions_tree.column(col, width=width)
-
-        self.recent_completions_tree.pack(fill='both', expand=True)
-    
-        # Load initial data
-        self.load_recent_completions()
-    
-    
-    
-
-    def create_form_field(self, parent, label_text, row, col):
-        """Create a modern form field"""
-        ttk.Label(parent, 
-                 text=label_text, 
-                 font=ModernCMMSStyles.BODY_FONT).grid(row=row, column=col, sticky='w', padx=5, pady=5)
-    
-        entry = ttk.Entry(parent, font=ModernCMMSStyles.BODY_FONT, width=20)
-        entry.grid(row=row, column=col+1, sticky='w', padx=5, pady=5)
-    
-    
-    
-    
-    
+        list_frame.grid_rowconfigure(0, weight=1)
+        list_frame.grid_columnconfigure(0, weight=1)
         
     
     
     def add_backup_button_to_equipment_tab(self):
-        """Add backup button to equipment tab after GUI is created"""
+        """Add backup and restore buttons to equipment tab after GUI is created"""
         try:
             if hasattr(self, 'backup_sync_dir') and hasattr(self, 'equipment_frame'):
-                # Find the controls frame and add the button
+                # Find the controls frame and add the buttons
                 for widget in self.equipment_frame.winfo_children():
                     if isinstance(widget, ttk.LabelFrame) and "Equipment Controls" in widget['text']:
-                        ttk.Button(widget, text="Open Backup Folder", 
-                                command=lambda: os.startfile(self.backup_sync_dir)).pack(side='left', padx=5)
-                        ttk.Button(widget, text="Test Backup Now", 
-                                command=self.test_backup_now).pack(side='left', padx=5)
+                        # Existing backup buttons
+                        #ttk.Button(widget, text="📁 Open Backup Folder", 
+                               # command=lambda: os.startfile(self.backup_sync_dir)).pack(side='left', padx=5)
+                        #ttk.Button(widget, text="💾 Test Backup Now", 
+                               # command=self.test_backup_now).pack(side='left', padx=5)
+                    
+                        # NEW: Add restore button
+                        ttk.Button(widget, text="📥 Restore from Backup", 
+                                command=self.create_database_restore_dialog,
+                                style='Accent.TButton').pack(side='left', padx=5)
                         break
         except Exception as e:
-            print(f"Error adding backup buttons: {e}")
+            print(f"Error adding backup/restore buttons: {e}")
     
     
     
@@ -6139,11 +4550,6 @@ class AITCMMSSystem:
     
     
     
-    
-   
-    
-    
-    
     def update_equipment_statistics(self):
         """Update equipment statistics display"""
         try:
@@ -6171,24 +4577,19 @@ class AITCMMSSystem:
         
             # Use the higher count for RTF
             rtf_total = max(rtf_count, rtf_assets_count)
-    
-            # Only update if we're in manager mode and have status cards
-            if self.current_user_role == 'Manager':
-                if hasattr(self, 'total_equipment_card'):
-                    self.total_equipment_card.update_value(total_assets)
-                if hasattr(self, 'active_equipment_card'):
-                    self.active_equipment_card.update_value(active_assets)
-                if hasattr(self, 'missing_equipment_card'):
-                    self.missing_equipment_card.update_value(cannot_find_count)
-                if hasattr(self, 'rtf_equipment_card'):
-                    self.rtf_equipment_card.update_value(rtf_total)
-    
+        
+            # Update labels
+            self.stats_total_label.config(text=f"Total Assets: {total_assets}")
+            self.stats_active_label.config(text=f"Active Assets: {active_assets}")
+            self.stats_cf_label.config(text=f"Cannot Find: {cannot_find_count}")
+            self.stats_rtf_label.config(text=f"Run to Failure: {rtf_total}")
+        
             # Update status bar
             self.update_status(f"Equipment stats updated - Total: {total_assets}, Active: {active_assets}, CF: {cannot_find_count}, RTF: {rtf_total}")
-    
+        
         except Exception as e:
             print(f"Error updating equipment statistics: {e}")
-            # Don't show error dialog to avoid interrupting user workflow
+            messagebox.showerror("Error", f"Failed to update equipment statistics: {str(e)}")
     
     def create_pm_scheduling_tab(self):
         """PM Scheduling and assignment tab"""
@@ -7156,273 +5557,76 @@ class AITCMMSSystem:
         self.load_run_to_failure_assets()
 
 
-   
+        # Enhanced Weekly Reports with Historical Week Selection
+        
+    
+    
+    
+    
+    
+        # Add this to your AITCMMSSystem class - Enhanced CM tab with SharePoint integration
 
-    def create_cm_management_tab_modern(self):
-        """Create modern CM management tab"""
-        self.cm_frame = ttk.Frame(self.notebook, style="Modern.TFrame")
+    def create_cm_management_tab(self):
+        """Enhanced Corrective Maintenance management tab with SharePoint integration"""
+        self.cm_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.cm_frame, text="Corrective Maintenance")
+    
+        # CM controls - Enhanced with SharePoint button
+        controls_frame = ttk.LabelFrame(self.cm_frame, text="CM Controls", padding=10)
+        controls_frame.pack(fill='x', padx=10, pady=5)
+    
+        ttk.Button(controls_frame, text="Create New CM", 
+                command=self.create_cm_dialog).pack(side='left', padx=5)
+        ttk.Button(controls_frame, text="Edit CM", 
+                command=self.edit_cm_dialog).pack(side='left', padx=5)
+        ttk.Button(controls_frame, text="Complete CM", 
+                command=self.complete_cm_dialog).pack(side='left', padx=5)
+        ttk.Button(controls_frame, text="Refresh CM List", 
+                command=self.load_corrective_maintenance).pack(side='left', padx=5)
+    
         
-        # Controls
-        controls_frame = ModernFrame(self.cm_frame, title="CM Controls")
-        controls_frame.pack(fill='x', padx=20, pady=10)
-        
-        # First row of controls - Action buttons
-        buttons_frame = ttk.Frame(controls_frame, padding=10)
-        buttons_frame.pack(fill='x')
-
-        ttk.Button(buttons_frame, text="Create CM", 
-                   command=self.create_cm_dialog,
-                   style="Success.TButton").pack(side='left', padx=5)
-        ttk.Button(buttons_frame, text="Edit CM", 
-                   command=self.edit_cm_dialog,
-                   style="Warning.TButton").pack(side='left', padx=5)
-        ttk.Button(buttons_frame, text="Complete CM", 
-                   command=self.complete_cm_dialog,
-                   style="Primary.TButton").pack(side='left', padx=5)
-        ttk.Button(buttons_frame, text="Refresh", 
-                   command=self.load_corrective_maintenance,
-                   style="Primary.TButton").pack(side='left', padx=5)
-        
-
-        # Second row - Search and filter controls
-        search_frame = ttk.Frame(controls_frame, padding=(10, 5, 10, 10))
-        search_frame.pack(fill='x')
-
-        # Search input
-        ttk.Label(search_frame, text="Search:", font=ModernCMMSStyles.BODY_FONT).pack(side='left', padx=5)
-        self.cm_search_var = tk.StringVar()
-        self.cm_search_var.trace('w', self.filter_cm_list)
-        search_entry = ttk.Entry(search_frame, textvariable=self.cm_search_var, width=25)
-        search_entry.pack(side='left', padx=5)
-
-        # Status filter
-        ttk.Label(search_frame, text="Status Filter:", font=ModernCMMSStyles.BODY_FONT).pack(side='left', padx=(20, 5))
-        self.cm_status_filter_var = tk.StringVar(value="All")
-        status_filter = ttk.Combobox(search_frame, textvariable=self.cm_status_filter_var, 
-                                values=["All", "Open", "In Progress", "Completed", "Cancelled"], 
-                                width=12, state='readonly')
-        status_filter.pack(side='left', padx=5)
-        status_filter.bind('<<ComboboxSelected>>', lambda e: self.filter_cm_list())
-
-        # Clear filters button
-        ttk.Button(search_frame, text="Clear Filters", 
-                command=self.clear_cm_filters,
-                style="Primary.TButton").pack(side='left', padx=10)
-        # In the search_frame section, add this button after the Clear Filters button:
-        ttk.Button(search_frame, text="📄 Export Filtered Results to PDF", 
-                command=self.export_filtered_cm_to_pdf,
-                style="Primary.TButton").pack(side='left', padx=10)
-
-        # Rest of your existing code for the CM list...
-        cm_list_frame = ModernFrame(self.cm_frame, title="Corrective Maintenance List")
-        cm_list_frame.pack(fill='both', expand=True, padx=20, pady=10)
-        
-        cm_container = ttk.Frame(cm_list_frame, padding=10)
-        cm_container.pack(fill='both', expand=True)
-
-        self.cm_tree = ModernTreeview(cm_container,
-                                    columns=('CM Number', 'Equipment', 'Description', 'Priority', 'Assigned', 'Status', 'Date Created', 'Date Completed'),
-                                    show='headings',
-                                    height=15)
-
+    
+       
+    
+        # CM list with enhanced columns for SharePoint data
+        cm_list_frame = ttk.LabelFrame(self.cm_frame, text="Corrective Maintenance List", padding=10)
+        cm_list_frame.pack(fill='both', expand=True, padx=10, pady=5)
+    
+        # Enhanced treeview with additional columns
+        self.cm_tree = ttk.Treeview(cm_list_frame,
+                                columns=('CM Number', 'BFM', 'Description', 'Priority', 'Assigned', 'Status', 'Created', 'Source'),
+                                show='headings')
+    
         cm_columns = {
-            'CM Number': ('CM Number', 120),
-            'Equipment': ('Equipment', 120),
-            'Description': ('Description', 250),
-            'Priority': ('Priority', 100),
-            'Assigned': ('Assigned To', 150),
-            'Status': ('Status', 100),
-            'Date Created': ('Date Created', 110),
-            'Date Completed': ('Date Completed', 120)
+            'CM Number': 120,
+            'BFM': 120,
+            'Description': 250,
+            'Priority': 80,
+            'Assigned': 120,
+            'Status': 80,
+            'Created': 100,
+            'Source': 80  # New column to show if from SharePoint
         }
-
-        for col, (heading, width) in cm_columns.items():
-            self.cm_tree.heading(col, text=heading)
+    
+        for col, width in cm_columns.items():
+            self.cm_tree.heading(col, text=col)
             self.cm_tree.column(col, width=width)
-
-        
-
-        self.cm_tree.pack(fill='both', expand=True)
-        # Add this at the end of your create_cm_management_tab_modern() method
-        self.add_cm_color_legend(self.cm_frame)
-
-    def create_pm_scheduling_tab_modern(self):
-        """Create modern PM scheduling tab"""
-        self.pm_schedule_frame = ttk.Frame(self.notebook, style="Modern.TFrame")
-        self.notebook.add(self.pm_schedule_frame, text="PM Scheduling")
-        
-        # Controls
-        controls_frame = ModernFrame(self.pm_schedule_frame, title="Scheduling Controls")
-        controls_frame.pack(fill='x', padx=20, pady=10)
-        
-        # Week selection and buttons
-        control_buttons = ttk.Frame(controls_frame, padding=10)
-        control_buttons.pack(fill='x')
-        
-        ttk.Label(control_buttons, text="Week Starting:", font=ModernCMMSStyles.BODY_FONT).pack(side='left', padx=5)
-        
-        self.week_start_var = tk.StringVar(value=self.current_week_start.strftime('%Y-%m-%d'))
-        week_entry = ttk.Entry(control_buttons, textvariable=self.week_start_var, width=12)
-        week_entry.pack(side='left', padx=5)
-        
-        ttk.Button(control_buttons, text="Generate Schedule", 
-                   command=self.generate_weekly_assignments,
-                   style="Primary.TButton").pack(side='left', padx=10)
-        ttk.Button(control_buttons, text="Print Forms", 
-                   command=self.print_weekly_pm_forms,
-                   style="Success.TButton").pack(side='left', padx=5)
-        ttk.Button(control_buttons, text="Export", 
-                   command=self.export_weekly_schedule,
-                   style="Primary.TButton").pack(side='left', padx=5)
     
-        # Schedule display
-        schedule_frame = ModernFrame(self.pm_schedule_frame, title="Weekly Schedule")
-        schedule_frame.pack(fill='both', expand=True, padx=20, pady=10)
-        
-        # Technician schedule notebook
-        self.technician_notebook = ttk.Notebook(schedule_frame, style="Modern.TNotebook", padding=10)
-        self.technician_notebook.pack(fill='both', expand=True)
-        
-        # Create tabs for technicians with modern treeviews
-        self.technician_trees = {}
-        for tech in self.technicians:
-            tech_frame = ttk.Frame(self.technician_notebook)
-            self.technician_notebook.add(tech_frame, text=tech)
-        
-            # Technician's schedule tree with color coding
-            tech_tree = ModernTreeview(tech_frame,
-                                     columns=('BFM', 'Description', 'PM Type', 'Due Date', 'Status'),
-                                     show='headings',
-                                     height=12)
-        
-            tech_columns = {
-                'BFM': ('BFM Equipment No.', 150),
-                'Description': ('Description', 250),
-                'PM Type': ('PM Type', 100),
-                'Due Date': ('Due Date', 120),
-                'Status': ('Status', 100)
-            }
-        
-            for col, (heading, width) in tech_columns.items():
-                tech_tree.heading(col, text=heading)
-                tech_tree.column(col, width=width)
-        
-            tech_tree.pack(fill='both', expand=True, padx=10, pady=10)
-            self.technician_trees[tech] = tech_tree
-
-    def create_analytics_tab_modern(self):
-        """Create modern analytics dashboard tab"""
-        self.analytics_frame = ttk.Frame(self.notebook, style="Modern.TFrame")
-        self.notebook.add(self.analytics_frame, text="Analytics Dashboard")
-        
-        # Controls
-        controls_frame = ModernFrame(self.analytics_frame, title="Analytics Controls")
-        controls_frame.pack(fill='x', padx=20, pady=10)
-        
-        buttons_frame = ttk.Frame(controls_frame, padding=10)
-        buttons_frame.pack(fill='x')
-        
-        ttk.Button(buttons_frame, text="Refresh Dashboard", 
-                   command=self.refresh_analytics_dashboard,
-                   style="Primary.TButton").pack(side='left', padx=5)
-        ttk.Button(buttons_frame, text="Equipment Analytics", 
-                   command=self.show_equipment_analytics,
-                   style="Primary.TButton").pack(side='left', padx=5)
-        ttk.Button(buttons_frame, text="PM Trends", 
-                   command=self.show_pm_trends,
-                   style="Primary.TButton").pack(side='left', padx=5)
-        ttk.Button(buttons_frame, text="Export Report", 
-                   command=self.export_analytics,
-                   style="Success.TButton").pack(side='left', padx=5)
+        # Scrollbars
+        cm_v_scrollbar = ttk.Scrollbar(cm_list_frame, orient='vertical', command=self.cm_tree.yview)
+        cm_h_scrollbar = ttk.Scrollbar(cm_list_frame, orient='horizontal', command=self.cm_tree.xview)
+        self.cm_tree.configure(yscrollcommand=cm_v_scrollbar.set, xscrollcommand=cm_h_scrollbar.set)
     
-        # Analytics content
-        content_frame = ModernFrame(self.analytics_frame, title="Performance Metrics")
-        content_frame.pack(fill='both', expand=True, padx=20, pady=10)
-        
-        # Charts and metrics container
-        metrics_container = ttk.Frame(content_frame, padding=10)
-        metrics_container.pack(fill='both', expand=True)
+        # Pack treeview and scrollbars
+        self.cm_tree.grid(row=0, column=0, sticky='nsew')
+        cm_v_scrollbar.grid(row=0, column=1, sticky='ns')
+        cm_h_scrollbar.grid(row=1, column=0, sticky='ew')
     
-        # Create analytics display area
-        self.analytics_text = tk.Text(metrics_container,
-                                    wrap='word',
-                                    font=('Consolas', 10),
-                                    background='white',
-                                    foreground=ModernCMMSStyles.DARK,
-                                    relief='flat',
-                                    borderwidth=1)
-    
-        analytics_scrollbar = ttk.Scrollbar(metrics_container, orient='vertical', command=self.analytics_text.yview)
-        self.analytics_text.configure(yscrollcommand=analytics_scrollbar.set)
+        cm_list_frame.grid_rowconfigure(0, weight=1)
+        cm_list_frame.grid_columnconfigure(0, weight=1)
         
-        self.analytics_text.pack(side='left', fill='both', expand=True)
-        analytics_scrollbar.pack(side='right', fill='y')
-
-    def create_technician_info_tab(self):
-        """Create an enhanced info tab for technicians"""
-        info_frame = ttk.Frame(self.notebook, style="Modern.TFrame")
-        self.notebook.add(info_frame, text="System Info")
-        
-        # Welcome message with modern styling
-        welcome_frame = ModernFrame(info_frame, title=f"Welcome to AIT CMMS, {self.user_name}")
-        welcome_frame.pack(fill='both', expand=True, padx=20, pady=20)
-        
-        # Info container
-        info_container = ttk.Frame(welcome_frame, padding=20)
-        info_container.pack(fill='both', expand=True)
-        
-        welcome_text = f"""
-    You are logged in as a Technician with access to:
-
-    ✓ Complete Corrective Maintenance (CM) System
-      • View ALL team CMs (everyone's entries)
-      • Create new CMs
-      • Edit existing CMs  
-      • Complete CMs
-      • View CM history and status
-
-    Team Collaboration Features:
-    ✓ You can see CMs created by all technicians
-    ✓ View work assigned to other team members
-    ✓ Complete CMs assigned to you or help with others
-    ✓ Full visibility of maintenance activities
-
-    System Information:
-    • User: {self.user_name}
-    • Role: {self.current_user_role}
-    • Login Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-    Quick Tips:
-    • Use the CM tab to view all corrective maintenance
-    • Create new CMs when you discover issues
-    • Enter accurate dates when creating CMs
-    • Provide detailed descriptions for better tracking
-    • Update CM status when work is completed
-    """
-    
-        info_label = ttk.Label(info_container, 
-                              text=welcome_text, 
-                              font=ModernCMMSStyles.BODY_FONT, 
-                              justify='left',
-                              background=ModernCMMSStyles.WHITE)
-        info_label.pack(anchor='w')
-    
-        # Quick access buttons with modern styling
-        buttons_frame = ttk.Frame(info_container)
-        buttons_frame.pack(fill='x', pady=20)
-    
-        ttk.Button(buttons_frame, text="Create New CM", 
-                   command=self.create_cm_dialog,
-                   style="Success.TButton").pack(side='left', padx=10)
-        ttk.Button(buttons_frame, text="View My Assigned CMs", 
-                   command=self.show_my_cms,
-                   style="Primary.TButton").pack(side='left', padx=10)
-        ttk.Button(buttons_frame, text="Refresh All CMs", 
-                   command=self.load_corrective_maintenance,
-                   style="Primary.TButton").pack(side='left', padx=10)
-        
-           
+        # Load CM data
+        self.load_corrective_maintenance()
 
     def import_sharepoint_cm_data(self):
         """Import CM data from SharePoint workbook"""
@@ -7644,7 +5848,6 @@ class AITCMMSSystem:
             ("Assigned Technician", "assigned_technician"),
             ("Status", "status"),
             ("Created Date", "created_date"),
-            ("Completion Date", "completion_date"), 
             ("Notes/Comments", "notes")
         ]
     
@@ -7813,13 +6016,14 @@ class AITCMMSSystem:
             print(f"SharePoint connection error: {e}")
             return False
 
+    # Enhanced load_corrective_maintenance to show source
     def load_corrective_maintenance(self):
-        """Load corrective maintenance data with creation and completion dates"""
+        """Load corrective maintenance data with enhanced source tracking"""
         try:
             cursor = self.conn.cursor()
             cursor.execute('''
                 SELECT cm_number, bfm_equipment_no, description, priority, 
-                    assigned_technician, status, created_date, completion_date
+                    assigned_technician, status, created_date, notes
                 FROM corrective_maintenance 
                 ORDER BY created_date DESC
             ''')
@@ -7830,18 +6034,17 @@ class AITCMMSSystem:
         
             # Add CM records
             for cm in cursor.fetchall():
-                cm_number, bfm_no, description, priority, assigned, status, created_date, completion_date = cm
+                cm_number, bfm_no, description, priority, assigned, status, created, notes = cm
+            
+                # Determine source
+                source = "SharePoint" if notes and "Imported from SharePoint" in notes else "Manual"
             
                 # Truncate description for display
-                display_desc = (description[:37] + '...') if description and len(description) > 40 else (description or '')
+                display_desc = (description[:47] + '...') if description and len(description) > 50 else (description or '')
             
-                # Format dates for display
-                created_display = created_date if created_date else ''
-                completed_display = completion_date if completion_date else ''
-            
-                # Use insert_with_color for automatic color coding based on status
-                values = (cm_number, bfm_no, display_desc, priority, assigned, status, created_display, completed_display)
-                self.cm_tree.insert_with_color('', 'end', values=values)
+                self.cm_tree.insert('', 'end', values=(
+                    cm_number, bfm_no, display_desc, priority, assigned, status, created, source
+                ))
             
         except Exception as e:
             print(f"Error loading corrective maintenance: {e}")
@@ -7891,176 +6094,29 @@ class AITCMMSSystem:
         # Load initial analytics
         self.refresh_analytics_dashboard()
     
-    
     def update_status(self, message):
         """Update status bar with message"""
-        if hasattr(self, 'status_label'):
-            self.status_label.config(text=message)
+        if hasattr(self, 'status_bar'):
+            self.status_bar.config(text=f"AIT CMMS - {message}")
             self.root.update_idletasks()
         else:
             print(f"STATUS: {message}")
-
-    def load_initial_data(self):
-        """Load initial data and populate the modern interface"""
-        try:
-            # Initialize database if needed
-            self.init_database()
-            
-            # Load equipment data
-            self.load_equipment_data()
+    
+    
+    def update_equipment_suggestions(self, event):
+        """Update equipment suggestions in completion form"""
+        search_term = self.completion_bfm_var.get().lower()
         
-            # Update dashboard cards (only for managers)
-            if self.current_user_role == 'Manager':
-                self.update_dashboard_cards()
-                self.update_equipment_statistics()
-        
-            # Load other data
-            self.load_recent_completions_modern()
-            self.load_corrective_maintenance()
-        
-            # Update status
-            self.update_status("System initialized successfully")
-        
-        except Exception as e:
-            self.update_status(f"Error loading data: {str(e)}")
-
-    # Add button style configurations to apply_modern_theme method
-    def apply_modern_theme_enhanced(self):
-        """Enhanced modern theme with button styles"""
-        style = ttk.Style()
-        style.theme_use('clam')
-    
-        # Configure notebook (tabs)
-        style.configure("Modern.TNotebook",
-                       background=ModernCMMSStyles.LIGHT,
-                       borderwidth=0)
-    
-        style.configure("Modern.TNotebook.Tab",
-                       background=ModernCMMSStyles.WHITE,
-                       foreground=ModernCMMSStyles.DARK,
-                       padding=[20, 10],
-                       font=ModernCMMSStyles.BODY_FONT)
-    
-        style.map("Modern.TNotebook.Tab",
-                background=[('selected', ModernCMMSStyles.PRIMARY),
-                        ('active', ModernCMMSStyles.INFO)],
-                foreground=[('selected', 'white'),
-                        ('active', 'white')])
-    
-        # Configure frames
-        style.configure("Modern.TFrame",
-                       background=ModernCMMSStyles.WHITE,
-                       relief="flat",
-                       borderwidth=1)
-    
-        # Configure labels
-        style.configure("Heading.TLabel",
-                       background=ModernCMMSStyles.WHITE,
-                       foreground=ModernCMMSStyles.PRIMARY,
-                       font=ModernCMMSStyles.HEADER_FONT)
-    
-        style.configure("Subheading.TLabel",
-                       background=ModernCMMSStyles.WHITE,
-                       foreground=ModernCMMSStyles.DARK,
-                       font=ModernCMMSStyles.SUBHEADER_FONT)
-    
-        # Configure modern button styles
-        style.configure("Primary.TButton",
-                       font=ModernCMMSStyles.BODY_FONT,
-                       padding=(10, 6))
-    
-        style.configure("Success.TButton",
-                       font=ModernCMMSStyles.BODY_FONT,
-                       padding=(10, 6))
-    
-        style.configure("Warning.TButton",
-                       font=ModernCMMSStyles.BODY_FONT,
-                       padding=(10, 6))
-    
-        style.configure("Danger.TButton",
-                       font=ModernCMMSStyles.BODY_FONT,
-                       padding=(10, 6))
-
-    # Enhanced load methods for modern display
-    def load_corrective_maintenance_modern(self):
-        """Load corrective maintenance data with modern color coding and dates"""
-        try:
+        if len(search_term) >= 2:
             cursor = self.conn.cursor()
             cursor.execute('''
-                SELECT cm_number, bfm_equipment_no, description, priority, 
-                    assigned_technician, status, created_date, completion_date
-                FROM corrective_maintenance 
-                ORDER BY created_date DESC
-            ''')
-    
-            # Clear existing items
-            for item in self.cm_tree.get_children():
-                self.cm_tree.delete(item)
-    
-            # Add CM records with color coding
-            for cm in cursor.fetchall():
-                cm_number, bfm_no, description, priority, assigned, status, created_date, completion_date = cm
+                SELECT bfm_equipment_no FROM equipment 
+                WHERE LOWER(bfm_equipment_no) LIKE ? OR LOWER(description) LIKE ?
+                ORDER BY bfm_equipment_no LIMIT 10
+            ''', (f'%{search_term}%', f'%{search_term}%'))
             
-                # Truncate description for display
-                display_desc = (description[:37] + '...') if description and len(description) > 40 else (description or '')
-                
-                # Format dates for display
-                created_display = created_date if created_date else ''
-                completed_display = completion_date if completion_date else ''
-            
-                values = (cm_number, bfm_no, display_desc, priority, assigned, status, created_display, completed_display)
-            
-                # Use insert_with_color for automatic color coding based on status
-                self.cm_tree.insert_with_color('', 'end', values=values)
-        
-        except Exception as e:
-            print(f"Error loading corrective maintenance: {e}")
-
-    def refresh_technician_schedules_modern(self):
-        """Refresh all technician schedule displays with modern color coding"""
-        week_start = self.week_start_var.get()
-    
-        for technician, tree in self.technician_trees.items():
-            # Clear existing items
-            for item in tree.get_children():
-                tree.delete(item)
-        
-            # Load scheduled PMs for this technician
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT ws.bfm_equipment_no, e.description, ws.pm_type, ws.scheduled_date, ws.status
-                FROM weekly_pm_schedules ws
-                JOIN equipment e ON ws.bfm_equipment_no = e.bfm_equipment_no
-                WHERE ws.assigned_technician = ? AND ws.week_start_date = ?
-                ORDER BY ws.scheduled_date
-            ''', (technician, week_start))
-        
-            assignments = cursor.fetchall()
-        
-            for assignment in assignments:
-                bfm_no, description, pm_type, scheduled_date, status = assignment
-                values = (bfm_no, description, pm_type, scheduled_date, status)
-                # Use insert_with_color for status-based color coding
-                tree.insert_with_color('', 'end', values=values)
-    
-    
-    
-    
-    
-        def update_equipment_suggestions(self, event):
-            """Update equipment suggestions in completion form"""
-            search_term = self.completion_bfm_var.get().lower()
-        
-            if len(search_term) >= 2:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                    SELECT bfm_equipment_no FROM equipment 
-                    WHERE LOWER(bfm_equipment_no) LIKE ? OR LOWER(description) LIKE ?
-                    ORDER BY bfm_equipment_no LIMIT 10
-                ''', (f'%{search_term}%', f'%{search_term}%'))
-            
-                suggestions = [row[0] for row in cursor.fetchall()]
-                self.bfm_combo['values'] = suggestions
+            suggestions = [row[0] for row in cursor.fetchall()]
+            self.bfm_combo['values'] = suggestions
     
     
     
@@ -8997,7 +7053,7 @@ class AITCMMSSystem:
                 SELECT completion_date, bfm_equipment_no, pm_type, technician_name, 
                     (labor_hours + labor_minutes/60.0) as total_hours
                 FROM pm_completions 
-                ORDER BY completion_date DESC, id DESC LIMIT 15
+                ORDER BY completion_date DESC, id DESC LIMIT 500
             ''')
         
             completions = cursor.fetchall()
@@ -9641,50 +7697,28 @@ class AITCMMSSystem:
         main_canvas.configure(scrollregion=main_canvas.bbox("all"))
     
     def complete_cm_dialog(self):
-        """Dialog to complete Corrective Maintenance with completion date field"""
+        """Dialog to complete Corrective Maintenance"""
         selected = self.cm_tree.selection()
         if not selected:
             messagebox.showwarning("Warning", "Please select a CM to complete")
             return
-    
+        
         # Get selected CM data
         item = self.cm_tree.item(selected[0])
         cm_number = item['values'][0]
-    
+        
         dialog = tk.Toplevel(self.root)
         dialog.title("Complete Corrective Maintenance")
-        dialog.geometry("500x450")  # Made taller for additional field
+        dialog.geometry("500x400")
         dialog.transient(self.root)
         dialog.grab_set()
-    
-        # Header
-        ttk.Label(dialog, text=f"Completing CM: {cm_number}", 
-                font=('Arial', 12, 'bold')).grid(row=0, column=0, columnspan=2, pady=10)
-    
-        row = 1
-    
-        # Completion Date (NEW FIELD)
-        ttk.Label(dialog, text="Completion Date (YYYY-MM-DD):").grid(row=row, column=0, sticky='w', padx=10, pady=5)
-        completion_date_var = tk.StringVar(value=datetime.now().strftime('%Y-%m-%d'))
-        completion_date_entry = ttk.Entry(dialog, textvariable=completion_date_var, width=15)
-        completion_date_entry.grid(row=row, column=1, sticky='w', padx=10, pady=5)
-    
-        # Date helper buttons
-        date_buttons_frame = ttk.Frame(dialog)
-        date_buttons_frame.grid(row=row, column=2, sticky='w', padx=5, pady=5)
-    
-        def set_date_to_today():
-            completion_date_var.set(datetime.now().strftime('%Y-%m-%d'))
-    
-        def set_date_to_yesterday():
-            yesterday = datetime.now() - timedelta(days=1)
-            completion_date_var.set(yesterday.strftime('%Y-%m-%d'))
-    
-        ttk.Button(date_buttons_frame, text="Today", command=set_date_to_today).pack(side='top', pady=1)
-        ttk.Button(date_buttons_frame, text="Yesterday", command=set_date_to_yesterday).pack(side='top', pady=1)
-    
+        
+        # Completion form
+        row = 0
+        
+        ttk.Label(dialog, text=f"Completing CM: {cm_number}").grid(row=row, column=0, columnspan=2, pady=10)
         row += 1
-    
+        
         # Labor hours
         ttk.Label(dialog, text="Labor Hours:").grid(row=row, column=0, sticky='w', padx=10, pady=5)
         labor_hours_var = tk.StringVar(value="0")
@@ -9702,54 +7736,15 @@ class AITCMMSSystem:
         root_cause_text = tk.Text(dialog, width=40, height=3)
         root_cause_text.grid(row=row, column=1, sticky='w', padx=10, pady=5)
         row += 1
-    
+        
         # Corrective action
         ttk.Label(dialog, text="Corrective Action:").grid(row=row, column=0, sticky='nw', padx=10, pady=5)
         corrective_action_text = tk.Text(dialog, width=40, height=3)
         corrective_action_text.grid(row=row, column=1, sticky='w', padx=10, pady=5)
         row += 1
-    
+        
         def complete_cm():
-            """Complete the CM with user-specified completion date"""
             try:
-                # Validate completion date
-                completion_date_input = completion_date_var.get().strip()
-            
-                if not completion_date_input:
-                    messagebox.showerror("Error", "Please enter a completion date")
-                    return
-            
-                # Try to parse the date to validate format
-                try:
-                    parsed_date = datetime.strptime(completion_date_input, '%Y-%m-%d')
-                
-                    # Check if date is reasonable
-                    if parsed_date > datetime.now() + timedelta(days=1):
-                        result = messagebox.askyesno("Future Date Warning", 
-                                                    f"The completion date '{completion_date_input}' is in the future.\n\n"
-                                                    f"Are you sure this is correct?")
-                        if not result:
-                            return
-                
-                    if parsed_date < datetime.now() - timedelta(days=365):
-                        result = messagebox.askyesno("Old Date Warning", 
-                                                    f"The completion date '{completion_date_input}' is more than 1 year ago.\n\n"
-                                                    f"Are you sure this is correct?")
-                        if not result:
-                            return
-                
-                    validated_completion_date = parsed_date.strftime('%Y-%m-%d')
-                
-                except ValueError:
-                    messagebox.showerror("Invalid Date Format", 
-                                        f"Please enter the date in YYYY-MM-DD format.\n\n"
-                                        f"Examples:\n"
-                                        f"• 2025-09-16 (September 16th, 2025)\n"
-                                        f"• 2025-12-15 (December 15th, 2025)\n\n"
-                                        f"You entered: '{completion_date_input}'")
-                    return
-            
-                # Update the CM with the user-specified completion date
                 cursor = self.conn.cursor()
                 cursor.execute('''
                     UPDATE corrective_maintenance SET
@@ -9761,7 +7756,7 @@ class AITCMMSSystem:
                     corrective_action = ?
                     WHERE cm_number = ?
                 ''', (
-                    validated_completion_date,  # Use the validated date
+                    datetime.now().strftime('%Y-%m-%d'),
                     float(labor_hours_var.get() or 0),
                     notes_text.get('1.0', 'end-1c'),
                     root_cause_text.get('1.0', 'end-1c'),
@@ -9769,24 +7764,45 @@ class AITCMMSSystem:
                     cm_number
                 ))
                 self.conn.commit()
-            
-                messagebox.showinfo("Success", 
-                                    f"CM {cm_number} completed successfully!\n\n"
-                                    f"Completion Date: {validated_completion_date}")
+                messagebox.showinfo("Success", "CM completed successfully!")
                 dialog.destroy()
                 self.load_corrective_maintenance()
-            
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to complete CM: {str(e)}")
-    
+        
         # Buttons
         button_frame = ttk.Frame(dialog)
-        button_frame.grid(row=row, column=0, columnspan=3, pady=20)
-    
+        button_frame.grid(row=row, column=0, columnspan=2, pady=20)
+        
         ttk.Button(button_frame, text="Complete CM", command=complete_cm).pack(side='left', padx=5)
         ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side='left', padx=5)
     
-    
+    def load_corrective_maintenance(self):
+        """Load corrective maintenance data"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT cm_number, bfm_equipment_no, description, priority, 
+                       assigned_technician, status, created_date
+                FROM corrective_maintenance 
+                ORDER BY created_date DESC
+            ''')
+            
+            # Clear existing items
+            for item in self.cm_tree.get_children():
+                self.cm_tree.delete(item)
+            
+            # Add CM records
+            for cm in cursor.fetchall():
+                cm_number, bfm_no, description, priority, assigned, status, created = cm
+                # Truncate description for display
+                display_desc = (description[:47] + '...') if len(description) > 50 else description
+                self.cm_tree.insert('', 'end', values=(
+                    cm_number, bfm_no, display_desc, priority, assigned, status, created
+                ))
+                
+        except Exception as e:
+            print(f"Error loading corrective maintenance: {e}")
     
     def refresh_analytics_dashboard(self):
         """Refresh analytics dashboard with current data"""
@@ -12067,9 +10083,8 @@ class AITCMMSSystem:
                              font=('Arial', 8, 'italic'), foreground='orange')
         warning_label.pack()
     
-    
     def refresh_equipment_list(self):
-        """Enhanced refresh with modern color coding"""
+        """Refresh equipment list display"""
         try:
             self.load_equipment_data()
         
@@ -12077,28 +10092,23 @@ class AITCMMSSystem:
             for item in self.equipment_tree.get_children():
                 self.equipment_tree.delete(item)
         
-            # Add equipment to tree with color coding
+            # Add equipment to tree
             for equipment in self.equipment_data:
                 if len(equipment) >= 9:
-                    values = (
+                    self.equipment_tree.insert('', 'end', values=(
                         equipment[1] or '',  # SAP
                         equipment[2] or '',  # BFM
                         equipment[3] or '',  # Description
                         equipment[5] or '',  # Location
+                        equipment[6] or '',  # Master LIN
                         'Yes' if equipment[7] else 'No',  # Monthly PM
+                        'Yes' if equipment[8] else 'No',  # Six Month PM
                         'Yes' if equipment[9] else 'No',  # Annual PM
                         equipment[16] or 'Active'  # Status
-                    )
-                
-                    # Use insert_with_color for automatic color coding
-                    self.equipment_tree.insert_with_color('', 'end', values=values)
+                    ))
         
-            # Update statistics and dashboard
-            if hasattr(self, 'update_equipment_statistics'):
-                self.update_equipment_statistics()
-        
-            if hasattr(self, 'update_dashboard_cards'):
-                self.update_dashboard_cards()
+            # Update statistics
+            self.update_equipment_statistics()
         
             # Update status
             self.update_status(f"Equipment list refreshed - {len(self.equipment_data)} items")
@@ -12106,78 +10116,7 @@ class AITCMMSSystem:
         except Exception as e:
             print(f"Error refreshing equipment list: {e}")
             messagebox.showerror("Error", f"Failed to refresh equipment list: {str(e)}")
-
-    def update_dashboard_cards(self):
-        """Update dashboard status cards with current data"""
-        if self.current_user_role != 'Manager':
-            return  # Only managers have dashboard cards
-        
-        try:
-            cursor = self.conn.cursor()
-            
-            # Total equipment
-            cursor.execute('SELECT COUNT(*) FROM equipment')
-            total_equipment = cursor.fetchone()[0]
-            self.total_equipment_card.update_value(total_equipment)
-            
-            # Active equipment
-            cursor.execute("SELECT COUNT(*) FROM equipment WHERE status = 'Active' OR status IS NULL")
-            active_equipment = cursor.fetchone()[0]
-            self.active_equipment_card.update_value(active_equipment)
-            
-            # Missing equipment (Cannot Find)
-            cursor.execute("SELECT COUNT(DISTINCT bfm_equipment_no) FROM cannot_find_assets WHERE status = 'Missing'")
-            missing_equipment = cursor.fetchone()[0]
-            self.missing_equipment_card.update_value(missing_equipment)
-            
-            # Run to Failure equipment
-            cursor.execute("SELECT COUNT(*) FROM equipment WHERE status = 'Run to Failure'")
-            rtf_equipment = cursor.fetchone()[0]
-            self.rtf_equipment_card.update_value(rtf_equipment)
-        
-            # Recent PMs (last 30 days)
-            cursor.execute('''
-                SELECT COUNT(*) FROM pm_completions 
-                WHERE completion_date >= DATE('now', '-30 days')
-            ''')
-            recent_pms = cursor.fetchone()[0]
-            self.recent_pms_card.update_value(recent_pms)
-        
-        except Exception as e:
-            print(f"Error updating dashboard cards: {e}")
-
-    def load_recent_completions_modern(self):
-        """Load recent PM completions with modern styling"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT completion_date, bfm_equipment_no, pm_type, technician_name, 
-                    (labor_hours + labor_minutes/60.0) as total_hours
-                FROM pm_completions
-                ORDER BY completion_date DESC
-                LIMIT 50
-            ''')
-        
-            completions = cursor.fetchall()
-        
-            # Clear existing items
-            for item in self.recent_completions_tree.get_children():
-                self.recent_completions_tree.delete(item)
-        
-            # Add completions with color coding
-            for completion in completions:
-                date, equipment, pm_type, technician, hours = completion
-                hours_str = f"{hours:.1f}h" if hours else "0.0h"
-                values = (date, equipment, pm_type, technician, 'Completed')
-                self.recent_completions_tree.insert_with_color('', 'end', values=values)
-            
-        except Exception as e:
-            print(f"Error loading recent completions: {e}")
     
-     
-     
-     
-     
     def filter_equipment_list(self, *args):
         """Filter equipment list based on search term"""
         search_term = self.equipment_search_var.get().lower()
@@ -13395,42 +11334,37 @@ class AITCMMSSystem:
         """PM History Search tab for comprehensive equipment completion information"""
         self.pm_history_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.pm_history_frame, text="PM History Search")
-
+    
         # Search controls
         search_controls_frame = ttk.LabelFrame(self.pm_history_frame, text="Search Equipment PM History", padding=15)
         search_controls_frame.pack(fill='x', padx=10, pady=5)
-
+    
         # Search input
         search_input_frame = ttk.Frame(search_controls_frame)
         search_input_frame.pack(fill='x', pady=5)
-
+    
         ttk.Label(search_input_frame, text="Search:").pack(side='left', padx=5)
         self.history_search_var = tk.StringVar()
         search_entry = ttk.Entry(search_input_frame, textvariable=self.history_search_var, width=30)
         search_entry.pack(side='left', padx=5)
-
+    
         ttk.Button(search_input_frame, text="Search", command=self.search_pm_history_simple).pack(side='left', padx=5)
         ttk.Button(search_input_frame, text="Clear", command=self.clear_search_simple).pack(side='left', padx=5)
-        
-        # ADD THIS LINE - Export button
-        ttk.Button(search_input_frame, text="📄 Export to PDF", command=self.export_pm_history_to_pdf).pack(side='left', padx=5)
-
+    
         # Results display
         results_frame = ttk.LabelFrame(self.pm_history_frame, text="Search Results", padding=10)
         results_frame.pack(fill='both', expand=True, padx=10, pady=5)
-
+    
         # Results tree
         self.history_search_tree = ttk.Treeview(results_frame,
                                             columns=('BFM No', 'SAP No', 'Description', 'PM Type', 'Technician', 'Date', 'Hours'),
                                             show='headings')
-
+    
         for col in ('BFM No', 'SAP No', 'Description', 'PM Type', 'Technician', 'Date', 'Hours'):
             self.history_search_tree.heading(col, text=col)
             self.history_search_tree.column(col, width=120)
-
+    
         self.history_search_tree.pack(fill='both', expand=True)
-    
-    
 
     def search_pm_history_simple(self):
         """Simple PM history search"""
