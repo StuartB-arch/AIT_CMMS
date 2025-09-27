@@ -22,7 +22,463 @@ import random
 import math
 import re
 from pathlib import Path
+from typing import List, Dict, Optional, Tuple, NamedTuple
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+    print("ReportLab not installed. PDF generation will not work.")
 
+
+
+
+class PMType(Enum):
+    MONTHLY = "Monthly"
+    ANNUAL = "Annual"
+
+class PMStatus(Enum):
+    DUE = "due"
+    NOT_DUE = "not_due"
+    RECENTLY_COMPLETED = "recently_completed"
+    CONFLICTED = "conflicted"
+
+@dataclass
+class Equipment:
+    bfm_no: str
+    description: str
+    has_monthly: bool
+    has_annual: bool
+    last_monthly_date: Optional[str]
+    last_annual_date: Optional[str]
+    status: str
+
+@dataclass
+class CompletionRecord:
+    bfm_no: str
+    pm_type: PMType
+    completion_date: datetime
+    technician: str
+
+@dataclass
+class PMAssignment:
+    bfm_no: str
+    pm_type: PMType
+    description: str
+    priority_score: int
+    reason: str
+
+class PMEligibilityResult(NamedTuple):
+    status: PMStatus
+    reason: str
+    priority_score: int = 0
+    days_overdue: int = 0
+
+class DateParser:
+    """Responsible for parsing and standardizing dates"""
+    
+    def __init__(self, conn):
+        self.conn = conn
+    
+    def parse_flexible(self, date_string: Optional[str]) -> Optional[datetime]:
+        """Parse date string with flexible format handling"""
+        if not date_string:
+            return None
+            
+        try:
+            # Use your existing DateStandardizer
+            standardizer = DateStandardizer(self.conn)
+            parsed_date = standardizer.parse_date_flexible(date_string)
+            if parsed_date:
+                return datetime.strptime(parsed_date, '%Y-%m-%d')
+        except Exception as e:
+            print(f"Date parsing error for '{date_string}': {e}")
+            
+        return None
+
+class CompletionRecordRepository:
+    """Responsible for retrieving completion records from database"""
+    
+    def __init__(self, conn):
+        self.conn = conn
+    
+    def get_recent_completions(self, bfm_no: str, days: int = 30) -> List[CompletionRecord]:
+        """Get recent completion records for equipment"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT bfm_equipment_no, pm_type, completion_date, technician_name
+            FROM pm_completions 
+            WHERE bfm_equipment_no = ?
+            AND completion_date >= DATE('now', '-{} days')
+            ORDER BY completion_date DESC
+        '''.format(days), (bfm_no,))
+        
+        results = []
+        for row in cursor.fetchall():
+            try:
+                completion_date = datetime.strptime(row[2], '%Y-%m-%d')
+                pm_type = PMType.MONTHLY if row[1] == 'Monthly' else PMType.ANNUAL
+                results.append(CompletionRecord(row[0], pm_type, completion_date, row[3]))
+            except Exception as e:
+                print(f"Error parsing completion record: {e}")
+                
+        return results
+    
+    def get_scheduled_pms(self, week_start: datetime, bfm_no: Optional[str] = None) -> List[Dict]:
+        """Get currently scheduled PMs for the week"""
+        cursor = self.conn.cursor()
+        
+        if bfm_no:
+            cursor.execute('''
+                SELECT bfm_equipment_no, pm_type, assigned_technician, status
+                FROM weekly_pm_schedules 
+                WHERE week_start_date = ? AND bfm_equipment_no = ?
+            ''', (week_start.strftime('%Y-%m-%d'), bfm_no))
+        else:
+            cursor.execute('''
+                SELECT bfm_equipment_no, pm_type, assigned_technician, status
+                FROM weekly_pm_schedules 
+                WHERE week_start_date = ?
+            ''', (week_start.strftime('%Y-%m-%d'),))
+            
+        return [{'bfm_no': row[0], 'pm_type': row[1], 'technician': row[2], 'status': row[3]} 
+                for row in cursor.fetchall()]
+
+class PMEligibilityChecker:
+    """Responsible for determining if a PM is eligible for scheduling"""
+    
+    PM_FREQUENCIES = {
+        PMType.MONTHLY: 30,
+        PMType.ANNUAL: 365
+    }
+    
+    def __init__(self, date_parser: DateParser, completion_repo: CompletionRecordRepository):
+        self.date_parser = date_parser
+        self.completion_repo = completion_repo
+    
+    def check_eligibility(self, equipment: Equipment, pm_type: PMType, 
+                         week_start: datetime) -> PMEligibilityResult:
+        """Check if equipment is eligible for PM assignment"""
+        
+        # Check if equipment supports this PM type
+        if pm_type == PMType.MONTHLY and not equipment.has_monthly:
+            return PMEligibilityResult(PMStatus.NOT_DUE, "Equipment doesn't require Monthly PM")
+        if pm_type == PMType.ANNUAL and not equipment.has_annual:
+            return PMEligibilityResult(PMStatus.NOT_DUE, "Equipment doesn't require Annual PM")
+        
+        # Get recent completions
+        recent_completions = self.completion_repo.get_recent_completions(equipment.bfm_no, days=60)
+        
+        # Check for recent completions of same type
+        same_type_completions = [c for c in recent_completions if c.pm_type == pm_type]
+        if same_type_completions:
+            latest_completion = max(same_type_completions, key=lambda x: x.completion_date)
+            days_since = (datetime.now() - latest_completion.completion_date).days
+            
+            min_interval = self._get_minimum_interval(pm_type)
+            if days_since < min_interval:
+                return PMEligibilityResult(
+                    PMStatus.RECENTLY_COMPLETED, 
+                    f"{pm_type.value} PM completed {days_since} days ago (min interval: {min_interval})"
+                )
+        
+        # Check for cross-PM conflicts
+        conflict_result = self._check_cross_pm_conflicts(recent_completions, pm_type)
+        if conflict_result.status == PMStatus.CONFLICTED:
+            return conflict_result
+        
+        # Check if already scheduled
+        scheduled_pms = self.completion_repo.get_scheduled_pms(week_start, equipment.bfm_no)
+        if any(s['pm_type'] == pm_type.value for s in scheduled_pms):
+            return PMEligibilityResult(PMStatus.CONFLICTED, f"Already scheduled for this week")
+        
+        # Check if due based on equipment table dates
+        return self._check_due_date(equipment, pm_type, recent_completions)
+    
+    def _get_minimum_interval(self, pm_type: PMType) -> int:
+        """Get minimum interval before rescheduling same PM type"""
+        frequency = self.PM_FREQUENCIES[pm_type]
+        return max(int(frequency * 0.75), 14)  # 75% of frequency or 14 days minimum
+    
+    def _check_cross_pm_conflicts(self, recent_completions: List[CompletionRecord], 
+                                 pm_type: PMType) -> PMEligibilityResult:
+        """Check for conflicts between Monthly and Annual PMs"""
+        
+        if pm_type == PMType.ANNUAL:
+            # Don't schedule Annual if Monthly was done very recently
+            monthly_completions = [c for c in recent_completions if c.pm_type == PMType.MONTHLY]
+            if monthly_completions:
+                latest_monthly = max(monthly_completions, key=lambda x: x.completion_date)
+                days_since_monthly = (datetime.now() - latest_monthly.completion_date).days
+                
+                if days_since_monthly < 7:
+                    return PMEligibilityResult(
+                        PMStatus.CONFLICTED,
+                        f"Annual blocked - Monthly PM completed {days_since_monthly} days ago"
+                    )
+        
+        elif pm_type == PMType.MONTHLY:
+            # Don't schedule Monthly if Annual was done recently
+            annual_completions = [c for c in recent_completions if c.pm_type == PMType.ANNUAL]
+            if annual_completions:
+                latest_annual = max(annual_completions, key=lambda x: x.completion_date)
+                days_since_annual = (datetime.now() - latest_annual.completion_date).days
+                
+                if days_since_annual < 30:
+                    return PMEligibilityResult(
+                        PMStatus.CONFLICTED,
+                        f"Monthly blocked - Annual PM completed {days_since_annual} days ago"
+                    )
+        
+        return PMEligibilityResult(PMStatus.DUE, "No cross-PM conflicts")
+    
+    def _check_due_date(self, equipment: Equipment, pm_type: PMType, 
+                       recent_completions: List[CompletionRecord]) -> PMEligibilityResult:
+        """Check if PM is due based on last completion date"""
+        
+        # Get the appropriate last date from equipment table
+        last_date_str = (equipment.last_monthly_date if pm_type == PMType.MONTHLY 
+                        else equipment.last_annual_date)
+        
+        # Use completion records if they're more recent
+        same_type_completions = [c for c in recent_completions if c.pm_type == pm_type]
+        if same_type_completions:
+            latest_completion = max(same_type_completions, key=lambda x: x.completion_date)
+            equipment_date = self.date_parser.parse_flexible(last_date_str)
+            
+            if not equipment_date or latest_completion.completion_date > equipment_date:
+                last_completion_date = latest_completion.completion_date
+                source = "completion_record"
+            else:
+                last_completion_date = equipment_date
+                source = "equipment_table"
+        else:
+            last_completion_date = self.date_parser.parse_flexible(last_date_str)
+            source = "equipment_table"
+        
+        # Never completed = high priority
+        if not last_completion_date:
+            priority = 1000 if pm_type == PMType.MONTHLY else 900  # Prioritize Monthly for new equipment
+            return PMEligibilityResult(
+                PMStatus.DUE, 
+                f"{pm_type.value} PM never completed - HIGH PRIORITY",
+                priority_score=priority
+            )
+        
+        # Calculate if due
+        frequency = self.PM_FREQUENCIES[pm_type]
+        days_since = (datetime.now() - last_completion_date).days
+        next_due_date = last_completion_date + timedelta(days=frequency)
+        days_overdue = (datetime.now() - next_due_date).days
+        
+        # Due if overdue or within 14 days of due date (early scheduling allowed)
+        if days_overdue >= 0:
+            priority = min(days_overdue * 10, 500)  # Higher priority for more overdue
+            return PMEligibilityResult(
+                PMStatus.DUE,
+                f"{pm_type.value} PM overdue by {days_overdue} days ({source})",
+                priority_score=priority,
+                days_overdue=days_overdue
+            )
+        elif abs(days_overdue) <= 14:  # Within 2 weeks of due
+            priority = max(100 - abs(days_overdue) * 5, 10)
+            return PMEligibilityResult(
+                PMStatus.DUE,
+                f"{pm_type.value} PM due in {abs(days_overdue)} days ({source})",
+                priority_score=priority
+            )
+        
+        return PMEligibilityResult(
+            PMStatus.NOT_DUE,
+            f"{pm_type.value} PM not due for {abs(days_overdue)} days"
+        )
+
+class PMAssignmentGenerator:
+    """Responsible for generating PM assignments"""
+    
+    def __init__(self, eligibility_checker: PMEligibilityChecker):
+        self.eligibility_checker = eligibility_checker
+    
+    def generate_assignments(self, equipment_list: List[Equipment], 
+                           week_start: datetime, max_assignments: int) -> List[PMAssignment]:
+        """Generate prioritized list of PM assignments"""
+        
+        potential_assignments = []
+        
+        for equipment in equipment_list:
+            # Skip inactive equipment
+            if equipment.status not in ['Active']:
+                continue
+            
+            # Check Monthly PM eligibility
+            if equipment.has_monthly:
+                monthly_result = self.eligibility_checker.check_eligibility(
+                    equipment, PMType.MONTHLY, week_start
+                )
+                if monthly_result.status == PMStatus.DUE:
+                    potential_assignments.append(PMAssignment(
+                        equipment.bfm_no,
+                        PMType.MONTHLY,
+                        equipment.description,
+                        monthly_result.priority_score,
+                        monthly_result.reason
+                    ))
+            
+            # Check Annual PM eligibility (only if Monthly isn't being assigned)
+            if equipment.has_annual:
+                # Don't assign both Monthly and Annual to same equipment in same week
+                has_monthly_assignment = any(
+                    a.bfm_no == equipment.bfm_no and a.pm_type == PMType.MONTHLY 
+                    for a in potential_assignments
+                )
+                
+                if not has_monthly_assignment:
+                    annual_result = self.eligibility_checker.check_eligibility(
+                        equipment, PMType.ANNUAL, week_start
+                    )
+                    if annual_result.status == PMStatus.DUE:
+                        potential_assignments.append(PMAssignment(
+                            equipment.bfm_no,
+                            PMType.ANNUAL,
+                            equipment.description,
+                            annual_result.priority_score,
+                            annual_result.reason
+                        ))
+        
+        # Sort by priority (highest first) and return top assignments
+        potential_assignments.sort(key=lambda x: x.priority_score, reverse=True)
+        return potential_assignments[:max_assignments]
+
+class PMSchedulingService:
+    """Main orchestrator class"""
+    
+    def __init__(self, conn, technicians: List[str]):
+        self.conn = conn
+        self.technicians = technicians
+        
+        # Initialize components
+        self.date_parser = DateParser(conn)
+        self.completion_repo = CompletionRecordRepository(conn)
+        self.eligibility_checker = PMEligibilityChecker(self.date_parser, self.completion_repo)
+        self.assignment_generator = PMAssignmentGenerator(self.eligibility_checker)
+    
+    def generate_weekly_schedule(self, week_start_str: str, weekly_pm_target: int) -> Dict:
+        """Generate weekly PM schedule with comprehensive validation"""
+        
+        try:
+            week_start = datetime.strptime(week_start_str, '%Y-%m-%d')
+            cursor = self.conn.cursor()
+            
+            print(f"DEBUG: NEW SYSTEM - Generating assignments for week {week_start_str}")
+            
+            # Clear existing assignments for this week
+            cursor.execute(
+                'DELETE FROM weekly_pm_schedules WHERE week_start_date = ?', 
+                (week_start_str,)
+            )
+            
+            # Get equipment list
+            equipment_list = self._get_active_equipment()
+            print(f"DEBUG: Found {len(equipment_list)} active equipment items")
+            
+            # Generate assignments
+            assignments = self.assignment_generator.generate_assignments(
+                equipment_list, week_start, weekly_pm_target
+            )
+            print(f"DEBUG: Generated {len(assignments)} potential assignments")
+            
+            # Assign to technicians and save
+            scheduled_assignments = self._assign_and_save(assignments, week_start, week_start_str)
+            
+            self.conn.commit()
+            
+            return {
+                'success': True,
+                'total_assignments': len(scheduled_assignments),
+                'unique_assets': len(set(a['bfm_no'] for a in scheduled_assignments)),
+                'assignments': scheduled_assignments
+            }
+            
+        except Exception as e:
+            self.conn.rollback()
+            import traceback
+            traceback.print_exc()
+            return {'success': False, 'error': str(e)}
+    
+    def _get_active_equipment(self) -> List[Equipment]:
+        """Get list of active equipment from database"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT bfm_equipment_no, description, monthly_pm, annual_pm,
+                   last_monthly_pm, last_annual_pm, status
+            FROM equipment
+            WHERE status = 'Active'
+            AND status != 'Run to Failure' 
+            AND status != 'Missing'
+            ORDER BY bfm_equipment_no
+        ''')
+        
+        equipment_list = []
+        for row in cursor.fetchall():
+            equipment_list.append(Equipment(
+                bfm_no=row[0],
+                description=row[1],
+                has_monthly=bool(row[2]),
+                has_annual=bool(row[3]),
+                last_monthly_date=row[4],
+                last_annual_date=row[5],
+                status=row[6]
+            ))
+        
+        return equipment_list
+    
+    def _assign_and_save(self, assignments: List[PMAssignment], week_start: datetime, week_start_str: str):
+        """Assign to technicians and save to database"""
+        cursor = self.conn.cursor()
+        scheduled_assignments = []
+        
+        for i, assignment in enumerate(assignments):
+            # Distribute among technicians
+            tech_index = i % len(self.technicians)
+            technician = self.technicians[tech_index]
+            
+            # Schedule throughout the week
+            day_offset = i % 5  # Spread across weekdays
+            scheduled_date = week_start + timedelta(days=day_offset)
+            
+            # Save to database
+            cursor.execute('''
+                INSERT INTO weekly_pm_schedules 
+                (week_start_date, bfm_equipment_no, pm_type, assigned_technician, scheduled_date)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (
+                week_start_str,
+                assignment.bfm_no,
+                assignment.pm_type.value,
+                technician,
+                scheduled_date.strftime('%Y-%m-%d')
+            ))
+            
+            scheduled_assignments.append({
+                'bfm_no': assignment.bfm_no,
+                'pm_type': assignment.pm_type.value,
+                'description': assignment.description,
+                'technician': technician,
+                'scheduled_date': scheduled_date,
+                'reason': assignment.reason,
+                'priority_score': assignment.priority_score
+            })
+            
+            print(f"DEBUG: NEW SYSTEM - Assigned {assignment.bfm_no} - {assignment.pm_type.value} PM to {technician}")
+        
+        return scheduled_assignments
 
 
 
@@ -184,6 +640,93 @@ class DateStandardizer:
 
 class AITCMMSSystem:
     """Complete AIT CMMS - Computerized Maintenance Management System"""
+    
+    # Add this method to your class
+    def setup_program_colors(self):
+        """Set up the color scheme for the entire program"""
+    
+        # Create style object
+        self.style = ttk.Style()
+    
+        # Choose base theme
+        self.style.theme_use('clam')  # Good base for customization
+    
+        # Set main window background
+        self.root.configure(bg="#e8f4f8")  # Light blue-gray
+    
+        # Configure Treeview (your asset lists)
+        self.style.configure("Treeview",
+                        background="#ffffff",        # White background
+                        foreground="#1e3a8a",       # Dark blue text
+                        rowheight=25,
+                        fieldbackground="#ffffff")   # White field background
+    
+        # Treeview headers
+        self.style.configure("Treeview.Heading",
+                        background="#3b82f6",       # Blue headers
+                        foreground="white",
+                        font=('TkDefaultFont', 9, 'bold'))
+    
+        # Buttons
+        self.style.configure("TButton",
+                        background="#3b82f6",       # Blue buttons
+                        foreground="white",
+                        padding=(10, 5),
+                        relief="flat",
+                        font=('TkDefaultFont', 9))
+    
+        # Button hover effects
+        self.style.map("TButton",
+                    background=[('active', '#60a5fa'),    # Lighter blue on hover
+                                ('pressed', '#1d4ed8')])   # Darker blue when pressed
+    
+        # LabelFrames (your control sections)
+        self.style.configure("TLabelframe",
+                        background="#e8f4f8",       # Light blue-gray
+                        foreground="#1e3a8a",       # Dark blue text
+                        borderwidth=2,
+                        relief="groove")
+    
+        self.style.configure("TLabelframe.Label",
+                        background="#e8f4f8",
+                        foreground="#1e3a8a",
+                        font=('TkDefaultFont', 10, 'bold'))
+    
+        # Frames
+        self.style.configure("TFrame",
+                        background="#e8f4f8")
+    
+        # Entry widgets
+        self.style.configure("TEntry",
+                        fieldbackground="#ffffff",
+                        foreground="#1e3a8a",
+                        borderwidth=1,
+                        relief="solid")
+    
+        # Combobox
+        self.style.configure("TCombobox",
+                        fieldbackground="#ffffff",
+                        foreground="#1e3a8a",
+                        arrowcolor="#3b82f6")
+    
+        # Scrollbars
+        self.style.configure("Vertical.TScrollbar",
+                        background="#d1d5db",
+                        troughcolor="#f3f4f6",
+                        borderwidth=1,
+                        arrowcolor="#3b82f6")
+    
+        self.style.configure("Horizontal.TScrollbar",
+                        background="#d1d5db",
+                        troughcolor="#f3f4f6",
+                        borderwidth=1,
+                        arrowcolor="#3b82f6")
+
+    
+    
+    
+    
+    
     
     def check_empty_database_and_offer_restore(self):
         """Check if database is empty and offer to restore from backup"""
@@ -2730,7 +3273,7 @@ class AITCMMSSystem:
     
         # Set up window close handler
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-    
+        self.setup_program_colors()
         print(f"AIT Complete CMMS System initialized successfully for {self.user_name} ({self.current_user_role})")
 
 
@@ -4604,7 +5147,7 @@ class AITCMMSSystem:
                   command=self.export_weekly_schedule).grid(row=0, column=4, padx=5)
         # Add this line after your existing buttons in the controls_frame section:
         ttk.Button(controls_frame, text="🔍 Validate Before Scheduling", 
-                  command=self.validate_weekly_schedule_before_generation).grid(row=0, column=5, padx=5)
+                  command=self.generate_weekly_assignments).grid(row=0, column=5, padx=5)
         
         # Schedule display
         schedule_frame = ttk.LabelFrame(self.pm_schedule_frame, text="Weekly PM Schedule", padding=10)
@@ -4748,6 +5291,7 @@ class AITCMMSSystem:
             self.recent_completions_tree.column(col, width=120)
         
         self.recent_completions_tree.pack(fill='both', expand=True)
+        self.recent_completions_tree.bind('<Double-1>', self.on_completion_double_click)
         
         # Load recent completions
         self.load_recent_completions()
@@ -5615,7 +6159,174 @@ class AITCMMSSystem:
             
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export monthly data: {str(e)}")   
+    
+    def on_completion_double_click(self, event):
+        """Handle double-click on recent PM completions to generate PDF"""
+        selection = self.recent_completions_tree.selection()
+        if not selection:
+            return
+    
+        # Get the selected item's values
+        item = self.recent_completions_tree.item(selection[0])
+        values = item['values']
+    
+        if len(values) >= 5:
+            completion_date = values[0]
+            bfm_no = values[1] 
+            pm_type = values[2]
+            technician = values[3]
         
+            # Get full completion details from database
+            self.generate_pm_completion_pdf(completion_date, bfm_no, pm_type, technician)
+
+    def generate_pm_completion_pdf(self, completion_date, bfm_no, pm_type, technician):
+        """Generate and export PM completion PDF document"""
+        try:
+            cursor = self.conn.cursor()
+        
+            # Get full completion details
+            cursor.execute('''
+                SELECT pc.*, e.sap_material_no, e.description, e.location
+                FROM pm_completions pc
+                LEFT JOIN equipment e ON pc.bfm_equipment_no = e.bfm_equipment_no
+                WHERE pc.completion_date = ? AND pc.bfm_equipment_no = ? 
+                AND pc.pm_type = ? AND pc.technician_name = ?
+            ''', (completion_date, bfm_no, pm_type, technician))
+        
+            completion_data = cursor.fetchone()
+        
+            if not completion_data:
+                messagebox.showerror("Error", "Could not find completion details")
+                return
+            
+            # Add just the title parameter
+            filename = filedialog.asksaveasfilename(
+                title="Save PM Completion Document"
+            )
+        
+            if filename:
+                self.create_pm_completion_pdf(completion_data, filename)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to generate PDF: {str(e)}")
+
+    def create_pm_completion_pdf(self, completion_data, filename):
+        """Create the actual PDF document"""
+        try:
+            # Based on the debug output, map the columns correctly:
+            # (538, '20243111', 'Annual', 'Ronald Houghs', '2025-9-19', 0.0, 30.0, '2025-9-19', '', '', '2026-09-10', 'Preventive_Maintenance_Form', 'A2', '2025-09-22 11:31:50', '96007107', 'DRILL TEMPLATE FOR STRINGER SPLICE FR30', 'LCS001 TOP')
+        
+            completion_id = completion_data[0]        # 538
+            bfm_no = completion_data[1]               # '20243111'
+            pm_type = completion_data[2]              # 'Annual'
+            technician_name = completion_data[3]      # 'Ronald Houghs'
+            completion_date = completion_data[4]      # '2025-9-19'
+            labor_hours = completion_data[5]          # 0.0
+            labor_minutes = completion_data[6]        # 30.0
+            pm_due_date = completion_data[7]          # '2025-9-19'
+            special_equipment = completion_data[8]    # ''
+            notes = completion_data[9]                # ''
+            next_annual_pm_date = completion_data[10] # '2026-09-10'
+            # Skip column 11 and 12 (appears to be form type and status)
+            updated_date = completion_data[13]        # '2025-09-22 11:31:50'
+            sap_material_no = completion_data[14]     # '96007107'
+            description = completion_data[15]         # 'DRILL TEMPLATE FOR STRINGER SPLICE FR30'
+            location = completion_data[16]            # 'LCS001 TOP'
+        
+            # Create PDF document
+            doc = SimpleDocTemplate(filename, pagesize=letter)
+            styles = getSampleStyleSheet()
+            story = []
+        
+            # Custom styles
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontSize=18,
+                spaceAfter=30,
+                alignment=1,  # Center alignment
+                textColor=colors.darkblue
+            )
+        
+            header_style = ParagraphStyle(
+                'CustomHeader',
+                parent=styles['Heading2'],
+                fontSize=14,
+                spaceAfter=12,
+                textColor=colors.darkblue
+            )
+        
+            # Add company logo if available
+            logo_path = r"C:\Users\stuar\Desktop\AIT_CMMS_EDIT\img\ait_Logo.png"  # Update this path to your logo
+            if os.path.exists(logo_path):
+                logo = Image(logo_path, width=2*inch, height=1*inch)
+                story.append(logo)
+                story.append(Spacer(1, 12))
+        
+            # Title
+            story.append(Paragraph("PM COMPLETION CERTIFICATE", title_style))
+            story.append(Spacer(1, 20))
+        
+            # Equipment Information Section
+            story.append(Paragraph("EQUIPMENT INFORMATION", header_style))
+            
+            equipment_info = f"""
+            <b>BFM Equipment Number:</b> {bfm_no}<br/>
+            <b>SAP Material Number:</b> {sap_material_no or 'N/A'}<br/>
+            <b>Equipment Description:</b> {description or 'N/A'}<br/>
+            <b>Location:</b> {location or 'N/A'}<br/>
+            """
+            story.append(Paragraph(equipment_info, styles['Normal']))
+            story.append(Spacer(1, 20))
+        
+            # PM Details Section
+            story.append(Paragraph("MAINTENANCE DETAILS", header_style))
+            
+            pm_details = f"""
+            <b>PM Type:</b> {pm_type}<br/>
+            <b>Completion Date:</b> {completion_date}<br/>
+            <b>Technician:</b> {technician_name}<br/>
+            <b>Labor Time:</b> {int(labor_hours)}h {int(labor_minutes)}m<br/>
+            <b>Special Equipment Used:</b> {special_equipment or 'None'}<br/>
+            <b>Next Annual PM Due:</b> {next_annual_pm_date or 'Not scheduled'}<br/>
+            """
+            story.append(Paragraph(pm_details, styles['Normal']))
+            story.append(Spacer(1, 20))
+            
+            # Technician Notes Section
+            story.append(Paragraph("TECHNICIAN VALIDATION", header_style))
+            
+            validation_text = f"""
+            <b>Equipment Status Validation:</b><br/>
+            The undersigned technician certifies that the preventive maintenance has been completed 
+            and no equipment problems were identified during the maintenance procedure.
+            <br/><br/>
+            <b>Technician Notes:</b><br/>
+            {notes or 'No issues reported. Equipment operating within normal parameters.'}
+            """
+            story.append(Paragraph(validation_text, styles['Normal']))
+            story.append(Spacer(1, 30))
+        
+            # Footer
+            story.append(Spacer(1, 30))
+            footer_text = f"""
+            <i>Document generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br/>
+            AIT Complete CMMS - Computerized Maintenance Management System</i>
+            """
+            story.append(Paragraph(footer_text, styles['Normal']))
+        
+            # Build the PDF
+            doc.build(story)
+        
+            messagebox.showinfo("Success", f"PM Completion document saved to:\n{filename}")
+        
+            # Ask if user wants to open the PDF
+            if messagebox.askyesno("Open Document", "Would you like to open the PDF document now?"):
+                os.startfile(filename)  # Windows
+            
+        except Exception as e:
+            messagebox.showerror("PDF Creation Error", f"Failed to create PDF: {str(e)}")
+            print(f"Full error: {e}")
     
     def create_cannot_find_tab(self):
         """Cannot Find Assets tab"""
@@ -5632,6 +6343,11 @@ class AITCMMSSystem:
                 command=self.export_cannot_find_pdf).pack(side='left', padx=5)
         ttk.Button(controls_frame, text="Mark as Found", 
                 command=self.mark_asset_found).pack(side='left', padx=5)
+        ttk.Button(controls_frame, text="Delete Asset", 
+            command=self.delete_cannot_find_asset).pack(side='left', padx=5)        
+        ttk.Button(controls_frame, text="Edit Asset", 
+            command=self.edit_cannot_find_asset).pack(side='left', padx=5)        
+                
     
         # Cannot Find list
         list_frame = ttk.LabelFrame(self.cannot_find_frame, text="Missing Assets", padding=10)
@@ -5669,7 +6385,212 @@ class AITCMMSSystem:
     
         # Load initial data
         self.load_cannot_find_assets()
+    
+    
+    def delete_cannot_find_asset(self):
+        """Remove selected asset from the displayed list only (not from database)"""
+        # Get selected item
+        selected_item = self.cannot_find_tree.selection()
+    
+        if not selected_item:
+            messagebox.showwarning("No Selection", "Please select an asset to remove.")
+            return
+    
+        # Get the selected item data
+        item = selected_item[0]
+        asset_data = self.cannot_find_tree.item(item)['values']
+        bfm_number = asset_data[0]  # Assuming BFM is the first column
+    
+        # Confirm removal
+        result = messagebox.askyesno(
+            "Confirm List Removal", 
+            f"Remove asset {bfm_number} from the current list?\n\n"
+            "Note: This item will reappear when you refresh the list. "
+            "To permanently remove it, use 'Mark as Found' or manage it through the database."
+        )
+    
+        if result:
+            # Simply remove from treeview
+            self.cannot_find_tree.delete(item)
+            messagebox.showinfo("Removed", f"Asset {bfm_number} has been removed from the list.")
+
+
+    def delete_from_database(self, bfm_number):
+        """Delete asset record from database"""
+        # Example using SQLite
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("DELETE FROM cannot_find_assets WHERE bfm_number = ?", (bfm_number,))
+            self.connection.commit()
+        except Exception as e:
+            raise Exception(f"Database error: {str(e)}")
+
+
+
+    def edit_cannot_find_asset(self):
+        """Edit selected asset from cannot find list"""
+        # Get selected item
+        selected_item = self.cannot_find_tree.selection()
+    
+        if not selected_item:
+            messagebox.showwarning("No Selection", "Please select an asset to edit.")
+            return
+    
+        # Get the selected item data
+        item = selected_item[0]
+        asset_data = self.cannot_find_tree.item(item)['values']
         
+        # Open edit window
+        self.open_edit_window(item, asset_data)
+
+
+    def open_edit_window(self, tree_item, asset_data):
+        """Open edit window for selected asset"""
+        # Create edit window
+        edit_window = tk.Toplevel(self.root)
+        edit_window.title("Edit Asset")
+        edit_window.geometry("500x400")
+        edit_window.resizable(True, True)
+    
+        # Make window modal
+        edit_window.transient(self.root)
+        edit_window.grab_set()
+    
+        # Center the window
+        edit_window.update_idletasks()
+        x = (edit_window.winfo_screenwidth() // 2) - (500 // 2)
+        y = (edit_window.winfo_screenheight() // 2) - (400 // 2)
+        edit_window.geometry(f"500x400+{x}+{y}")
+    
+        # Create main frame with padding
+        main_frame = ttk.Frame(edit_window, padding=20)
+        main_frame.pack(fill='both', expand=True)
+    
+        # Title
+        title_label = ttk.Label(main_frame, text="Edit Asset Information", 
+                            font=('TkDefaultFont', 12, 'bold'))
+        title_label.pack(pady=(0, 20))
+    
+        # Create form frame
+        form_frame = ttk.Frame(main_frame)
+        form_frame.pack(fill='both', expand=True)
+    
+        # Field labels and entry variables
+        fields = [
+            ('BFM Equipment No.', asset_data[0] if len(asset_data) > 0 else ''),
+            ('Description', asset_data[1] if len(asset_data) > 1 else ''),
+            ('Location', asset_data[2] if len(asset_data) > 2 else ''),
+            ('Technician', asset_data[3] if len(asset_data) > 3 else ''),
+            ('Report Date', asset_data[4] if len(asset_data) > 4 else ''),
+            ('Status', asset_data[5] if len(asset_data) > 5 else '')
+        ]
+    
+        # Store entry widgets for later access
+        entries = {}
+    
+        # Create form fields
+        for i, (label_text, value) in enumerate(fields):
+            # Label
+            label = ttk.Label(form_frame, text=label_text + ":")
+            label.grid(row=i, column=0, sticky='w', padx=(0, 10), pady=5)
+        
+            # Entry widget
+            if label_text == 'Status':
+                # Use combobox for status
+                entry = ttk.Combobox(form_frame, values=['Missing', 'Found', 'Damaged', 'Disposed'])
+                entry.set(value)
+            elif label_text == 'Description':
+                # Use text widget for description (multiline)
+                entry = tk.Text(form_frame, height=3, width=40)
+                entry.insert('1.0', value)
+            else:
+                entry = ttk.Entry(form_frame, width=40)
+                entry.insert(0, value)
+        
+            entry.grid(row=i, column=1, sticky='ew', pady=5)
+            entries[label_text] = entry
+    
+        # Configure grid weights
+        form_frame.grid_columnconfigure(1, weight=1)
+    
+        # Button frame
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill='x', pady=(20, 0))
+    
+        # Buttons
+        def save_changes():
+            """Save the edited data"""
+            try:
+                # Get updated values
+                updated_data = []
+                for field_name, _ in fields:
+                    entry_widget = entries[field_name]
+                    if isinstance(entry_widget, tk.Text):
+                        value = entry_widget.get('1.0', 'end-1c')  # Get text content
+                    else:
+                        value = entry_widget.get()
+                    updated_data.append(value)
+            
+                # Validate required fields
+                if not updated_data[0].strip():  # BFM number is required
+                    messagebox.showerror("Validation Error", "BFM Equipment No. is required.")
+                    return
+            
+                # TODO: Update database here
+                # Example: self.update_asset_in_database(updated_data)
+            
+                # Update treeview
+                self.cannot_find_tree.item(tree_item, values=updated_data)
+            
+                # Show success message
+                messagebox.showinfo("Success", "Asset information updated successfully.")
+                
+                # Close edit window
+                edit_window.destroy()
+            
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to update asset: {str(e)}")
+    
+        def cancel_edit():
+            """Cancel editing and close window"""
+            edit_window.destroy()
+    
+        # Save and Cancel buttons
+        ttk.Button(button_frame, text="Save Changes", 
+                command=save_changes).pack(side='right', padx=(5, 0))
+        ttk.Button(button_frame, text="Cancel", 
+                command=cancel_edit).pack(side='right')
+    
+        # Focus on first entry
+        if fields:
+            first_entry = entries[fields[0][0]]
+            if not isinstance(first_entry, tk.Text):
+                first_entry.focus()
+                first_entry.select_range(0, tk.END)
+            else:
+                first_entry.focus()
+
+    def update_asset_in_database(self, asset_data):
+        """Update asset record in database"""
+        # Example using SQLite
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("""
+                UPDATE cannot_find_assets 
+                SET description = ?, location = ?, technician = ?, 
+                    report_date = ?, status = ?
+                WHERE bfm_number = ?
+            """, (asset_data[1], asset_data[2], asset_data[3], 
+                asset_data[4], asset_data[5], asset_data[0]))
+            self.connection.commit()
+        except Exception as e:
+            raise Exception(f"Database error: {str(e)}")
+
+
+
+
+
+    
         
     def create_run_to_failure_tab(self):
         """Run to Failure Assets tab"""
@@ -10415,597 +11336,41 @@ class AITCMMSSystem:
             print(f"Error loading equipment data: {e}")
             self.equipment_data = []
     
+    
     def generate_weekly_assignments(self):
         """
-        SIMPLIFIED weekly assignment generation
+        NEW SOLID PM assignment generation - prevents duplicates
         """
         try:
-            week_start = datetime.strptime(self.week_start_var.get(), '%Y-%m-%d')
-            week_end = week_start + timedelta(days=6)
-            cursor = self.conn.cursor()
+            # Create the new PM scheduling service
+            pm_service = PMSchedulingService(self.conn, self.technicians)
         
-            print(f"DEBUG: Generating assignments for week {week_start.strftime('%Y-%m-%d')}")
+            # Get the week start date
+            week_start = self.week_start_var.get()
         
-            # Clear existing assignments for this week
-            cursor.execute('DELETE FROM weekly_pm_schedules WHERE week_start_date = ?', 
-                        (week_start.strftime('%Y-%m-%d'),))
+            # Generate the schedule
+            result = pm_service.generate_weekly_schedule(week_start, self.weekly_pm_target)
         
-            # Get all active equipment
-            cursor.execute('''
-                SELECT e.bfm_equipment_no, e.description, e.monthly_pm, e.annual_pm,
-                    e.last_monthly_pm, e.last_annual_pm
-                FROM equipment e
-                WHERE e.status = 'Active' 
-                AND e.status != 'Run to Failure' 
-                AND e.status != 'Missing'
-                ORDER BY e.bfm_equipment_no
-            ''')
-            equipment_list = cursor.fetchall()
-        
-            # Generate PM assignments with SIMPLIFIED logic
-            pm_assignments = []
-            assigned_assets = set()
-        
-            for equipment in equipment_list:
-                (bfm_no, description, monthly, annual, last_monthly, last_annual) = equipment
-            
-                # Skip if already assigned
-                if bfm_no in assigned_assets:
-                    continue
-            
-                assigned_pm = None
-            
-                # SIMPLIFIED PRIORITY LOGIC:
-                # 1. If never done, prioritize Monthly
-                # 2. If Monthly is overdue, assign Monthly
-                # 3. If Annual is significantly overdue, assign Annual
-            
-                if monthly and (not last_monthly or self.is_pm_overdue(last_monthly, 30)):
-                    assigned_pm = 'Monthly'
-                elif annual and (not last_annual or self.is_pm_overdue(last_annual, 365)):
-                    # Only assign Annual if Monthly is current or doesn't exist
-                    if not monthly or (last_monthly and not self.is_pm_overdue(last_monthly, 30)):
-                        assigned_pm = 'Annual'
-            
-                if assigned_pm:
-                    pm_assignments.append((bfm_no, assigned_pm, description))
-                    assigned_assets.add(bfm_no)
-                    print(f"DEBUG: Assigned {bfm_no} - {assigned_pm} PM")
-        
-            print(f"DEBUG: Total assignments: {len(pm_assignments)}")
-        
-            # Distribute among technicians (simplified)
-            total_pms = min(self.weekly_pm_target, len(pm_assignments))
-            pms_per_tech = total_pms // len(self.technicians)
-            extra_pms = total_pms % len(self.technicians)
-        
-            assignment_index = 0
-        
-            for tech_index, technician in enumerate(self.technicians):
-                tech_pm_count = pms_per_tech + (1 if tech_index < extra_pms else 0)
-            
-                for _ in range(tech_pm_count):
-                    if assignment_index < len(pm_assignments):
-                        bfm_no, pm_type, description = pm_assignments[assignment_index]
-                    
-                        # Schedule throughout the week
-                        day_offset = (assignment_index % 5)
-                        scheduled_date = week_start + timedelta(days=day_offset)
-                    
-                        cursor.execute('''
-                            INSERT INTO weekly_pm_schedules 
-                            (week_start_date, bfm_equipment_no, pm_type, assigned_technician, scheduled_date)
-                            VALUES (?, ?, ?, ?, ?)
-                        ''', (
-                            week_start.strftime('%Y-%m-%d'),
-                            bfm_no,
-                            pm_type,
-                            technician,
-                            scheduled_date.strftime('%Y-%m-%d')
-                        ))
-                    
-                        assignment_index += 1
-        
-            self.conn.commit()
-        
-            # Show results
-            messagebox.showinfo("Scheduling Complete", 
-                            f"Generated {total_pms} PM assignments for week {week_start.strftime('%Y-%m-%d')}\n\n"
-                            f"Unique assets: {len(assigned_assets)}")
-        
-            # Refresh displays
-            self.refresh_technician_schedules()
-            self.update_status(f"Generated {total_pms} PM assignments")
-        
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to generate assignments: {str(e)}")
-            import traceback
-            traceback.print_exc()
-
-    def is_pm_overdue(self, last_pm_date, frequency_days):
-        """
-        Simple overdue check
-        """
-        if not last_pm_date:
-            return True  # Never done = overdue
-        
-        try:
-            standardizer = DateStandardizer(self.conn)
-            parsed_date = standardizer.parse_date_flexible(last_pm_date)
-        
-            if parsed_date:
-                last_date = datetime.strptime(parsed_date, '%Y-%m-%d')
-                days_since = (datetime.now() - last_date).days
-                return days_since >= frequency_days * 0.8  # 80% of frequency = overdue
-            else:
-                return True  # Can't parse = assume overdue
-            
-        except Exception:
-            return True  # Error = assume overdue
-
-    def check_pm_scheduling_status_comprehensive(self, cursor, bfm_no, pm_type, last_pm_date, next_pm_date, 
-                              frequency_days, week_start, week_end):
-        """
-        COMPREHENSIVE validation against ALL completed PMs
-        """
-        try:
-            current_date = datetime.now()
-        
-            status = {
-                'schedule': False,
-                'conflict': False,
-                'reason': '',
-                'last_date': last_pm_date,
-                'days_since': None,
-                'days_overdue': None
-            }
-        
-            print(f"DEBUG: Comprehensive check {bfm_no} {pm_type} PM")
-        
-            # Check 1: Get ALL recent PM completions for this equipment (any type)
-            cursor.execute('''
-                SELECT pm_type, completion_date, technician_name
-                FROM pm_completions 
-                WHERE bfm_equipment_no = ?
-                AND completion_date >= DATE(?, '-30 days')  -- Check last 30 days
-                ORDER BY completion_date DESC
-            ''', (bfm_no, current_date.strftime('%Y-%m-%d')))
-        
-            all_recent_completions = cursor.fetchall()
-        
-            # Check if THIS specific PM type was completed recently
-            for completed_pm_type, completion_date, technician in all_recent_completions:
-                if completed_pm_type == pm_type:
-                    try:
-                        comp_date_obj = datetime.strptime(completion_date, '%Y-%m-%d')
-                        days_since_completion = (current_date - comp_date_obj).days
-                    
-                        # Don't reschedule if completed within minimum interval
-                        min_interval = max(frequency_days * 0.75, 14)  # 75% of frequency or 14 days minimum
-                    
-                        if days_since_completion < min_interval:
-                            status['conflict'] = True
-                            status['reason'] = f"{pm_type} PM completed {days_since_completion} days ago by {technician} (min interval: {min_interval} days)"
-                            return status
-                        
-                    except Exception as e:
-                        print(f"DEBUG: Error parsing completion date {completion_date}: {e}")
-        
-            # Check 2: Cross-validation between PM types
-            if pm_type == 'Annual':
-                # If Annual PM is being scheduled, check if Monthly was completed very recently
-                for completed_pm_type, completion_date, technician in all_recent_completions:
-                    if completed_pm_type == 'Monthly':
-                        try:
-                            comp_date_obj = datetime.strptime(completion_date, '%Y-%m-%d')
-                            days_since_monthly = (current_date - comp_date_obj).days
-                        
-                            # If Monthly was completed less than 7 days ago, don't schedule Annual yet
-                            if days_since_monthly < 7:
-                                status['conflict'] = True
-                                status['reason'] = f"Annual PM blocked - Monthly PM completed {days_since_monthly} days ago by {technician}"
-                                return status
-                            
-                        except Exception as e:
-                            print(f"DEBUG: Error parsing monthly completion date: {e}")
-        
-            elif pm_type == 'Monthly':
-                # If Monthly PM is being scheduled, check if Annual was completed recently
-                for completed_pm_type, completion_date, technician in all_recent_completions:
-                    if completed_pm_type == 'Annual':
-                        try:
-                            comp_date_obj = datetime.strptime(completion_date, '%Y-%m-%d')
-                            days_since_annual = (current_date - comp_date_obj).days
-                        
-                            # If Annual was completed less than 30 days ago, Monthly might not be needed
-                            if days_since_annual < 30:
-                                status['conflict'] = True
-                                status['reason'] = f"Monthly PM blocked - Annual PM completed {days_since_annual} days ago by {technician}"
-                                return status
-                            
-                        except Exception as e:
-                            print(f"DEBUG: Error parsing annual completion date: {e}")
-        
-            # Check 3: Validate against equipment table dates
-            if last_pm_date:
-                try:
-                    standardizer = DateStandardizer(self.conn)
-                    parsed_last_date = standardizer.parse_date_flexible(last_pm_date)
-                
-                    if parsed_last_date:
-                        last_date_obj = datetime.strptime(parsed_last_date, '%Y-%m-%d')
-                        days_since_last = (current_date - last_date_obj).days
-                        status['days_since'] = days_since_last
-                    
-                        # Check if actually due
-                        if days_since_last >= frequency_days * 0.8:  # 80% of frequency
-                            status['days_overdue'] = days_since_last - frequency_days
-                        
-                            # Additional check: make sure completion records align
-                            equipment_date_conflict = False
-                            for completed_pm_type, completion_date, technician in all_recent_completions:
-                                if completed_pm_type == pm_type:
-                                    try:
-                                        comp_date_obj = datetime.strptime(completion_date, '%Y-%m-%d')
-                                        if comp_date_obj > last_date_obj:
-                                            print(f"DEBUG: Equipment table out of sync - completion record newer than equipment date")
-                                            equipment_date_conflict = True
-                                            break
-                                    except:
-                                        pass
-                        
-                            if equipment_date_conflict:
-                                status['conflict'] = True
-                                status['reason'] = f"{pm_type} PM data inconsistency - equipment table vs completion records"
-                                return status
-                        
-                            status['schedule'] = True
-                            status['reason'] = f"{pm_type} PM due (completed {days_since_last} days ago, overdue by {status['days_overdue']} days)"
-                            return status
-                        else:
-                            days_until_due = frequency_days - days_since_last
-                            if days_until_due <= 14:  # Allow up to 2 weeks early
-                                status['schedule'] = True
-                                status['reason'] = f"{pm_type} PM due soon ({days_until_due} days early)"
-                                return status
-                            else:
-                                status['conflict'] = True
-                                status['reason'] = f"{pm_type} PM not due for {days_until_due} days"
-                                return status
-                
-                except Exception as e:
-                    print(f"DEBUG: Error processing equipment table date: {e}")
-        
-            # Check 4: Never done equipment - prioritize Monthly
-            if not last_pm_date:
-                if pm_type == 'Monthly':
-                    status['schedule'] = True
-                    status['reason'] = f"Monthly PM never completed - FIRST TIME PRIORITY"
-                    status['days_since'] = 9999
-                    return status
-                elif pm_type == 'Annual':
-                    # Check if Monthly is also never done
-                    cursor.execute('SELECT last_monthly_pm FROM equipment WHERE bfm_equipment_no = ?', (bfm_no,))
-                    monthly_result = cursor.fetchone()
-                    if monthly_result and not monthly_result[0]:
-                        status['conflict'] = True
-                        status['reason'] = f"Annual PM blocked - Monthly PM should be completed first for new equipment"
-                        return status
-                    else:
-                        status['schedule'] = True
-                        status['reason'] = f"Annual PM never completed - HIGH PRIORITY"
-                        status['days_since'] = 9999
-                        return status
-        
-            # Default: allow scheduling if no conflicts found
-            status['schedule'] = True
-            status['reason'] = f"{pm_type} PM cleared for scheduling"
-            return status
-        
-        except Exception as e:
-            print(f"ERROR: Exception in comprehensive check for {bfm_no}: {e}")
-            # On error, don't schedule to be safe
-            status['conflict'] = True
-            status['reason'] = f"{pm_type} PM validation error - blocked for safety"
-            return status
-
-
-    def validate_against_recent_completions(self, week_start):
-        """
-        Specific validation against your recent completions from 2025-09-04
-        """
-        try:
-            cursor = self.conn.cursor()
-        
-            # Get all completions from the problematic date
-            cursor.execute('''
-                SELECT bfm_equipment_no, pm_type, technician_name
-                FROM pm_completions 
-                WHERE completion_date = '2025-09-04'
-                ORDER BY bfm_equipment_no
-            ''')
-        
-            sept_4_completions = cursor.fetchall()
-        
-            if not sept_4_completions:
-                return []  # No completions on that date
-        
-            print(f"DEBUG: Found {len(sept_4_completions)} completions on 2025-09-04")
-        
-            # Check if any of these are being rescheduled
-            conflicts = []
-            cursor.execute('''
-                SELECT bfm_equipment_no, pm_type 
-                FROM weekly_pm_schedules 
-                WHERE week_start_date = ?
-            ''', (week_start.strftime('%Y-%m-%d'),))
-        
-            current_schedule = cursor.fetchall()
-        
-            for scheduled_bfm, scheduled_pm_type in current_schedule:
-                for completed_bfm, completed_pm_type, technician in sept_4_completions:
-                    if (scheduled_bfm == completed_bfm and 
-                        (scheduled_pm_type == completed_pm_type or 
-                        (scheduled_pm_type == 'Annual' and completed_pm_type in ['Monthly', 'Annual']))):
-                    
-                        conflicts.append({
-                            'bfm_no': scheduled_bfm,
-                            'scheduled_type': scheduled_pm_type,
-                            'completed_type': completed_pm_type,
-                            'technician': technician
-                        })
-        
-            return conflicts
-        
-        except Exception as e:
-            print(f"ERROR: Error checking recent completions: {e}")
-            return []
-
-
-    def add_comprehensive_validation_to_generate_weekly_assignments(self):
-        """
-        Add this validation call to your generate_weekly_assignments method
-        """
-        # Add this code BEFORE the assignment generation in generate_weekly_assignments
-    
-        # Validate against recent completions
-        week_start = datetime.strptime(self.week_start_var.get(), '%Y-%m-%d')
-        completion_conflicts = self.validate_against_recent_completions(week_start)
-        
-        if completion_conflicts:
-            conflict_msg = f"POTENTIAL DUPLICATE SCHEDULING DETECTED:\n\n"
-            conflict_msg += f"The following equipment was completed on 2025-09-04 but is being rescheduled:\n\n"
-        
-            for conflict in completion_conflicts[:10]:  # Show first 10
-                conflict_msg += f"• {conflict['bfm_no']}: Scheduling {conflict['scheduled_type']} PM, but {conflict['completed_type']} PM was completed by {conflict['technician']}\n"
-        
-            if len(completion_conflicts) > 10:
-                conflict_msg += f"\n... and {len(completion_conflicts) - 10} more conflicts"
-        
-            result = messagebox.askyesno(
-                "Duplicate Scheduling Warning",
-                f"{conflict_msg}\n\n"
-                f"Do you want to proceed anyway?\n\n"
-                f"Click 'No' to cancel and review the issues.",
-                icon='warning'
-            )
-        
-            if not result:
-                self.update_status("Scheduling cancelled due to duplicate PM conflicts")
-                return False
-    
-        return True  # Continue with scheduling
-
-
-    def validate_weekly_schedule_before_generation(self):
-        """
-        SIMPLIFIED validation that's less restrictive
-        """
-        try:
-            week_start = datetime.strptime(self.week_start_var.get(), '%Y-%m-%d')
-            cursor = self.conn.cursor()
-        
-            validation_issues = []
-        
-            # Check 1: Equipment with very recent completions (last 3 days only)
-            cursor.execute('''
-                SELECT pc.bfm_equipment_no, pc.pm_type, pc.completion_date, pc.technician_name
-                FROM pm_completions pc
-                WHERE pc.completion_date >= DATE(?, '-3 days')  -- Only last 3 days
-                ORDER BY pc.completion_date DESC
-                LIMIT 20
-            ''', (week_start.strftime('%Y-%m-%d'),))
-        
-            recent_completions = cursor.fetchall()
-        
-            if recent_completions:
-                validation_issues.append("VERY RECENT COMPLETIONS (Last 3 days):")
-                for bfm_no, pm_type, comp_date, tech in recent_completions[:10]:
-                    validation_issues.append(f"  • {bfm_no} - {pm_type} PM completed {comp_date} by {tech}")
-        
-            # Check 2: Already scheduled for this exact week
-            cursor.execute('''
-                SELECT ws.bfm_equipment_no, ws.pm_type, ws.assigned_technician, ws.status
-                FROM weekly_pm_schedules ws
-                WHERE ws.week_start_date = ?
-            ''', (week_start.strftime('%Y-%m-%d'),))
-        
-            current_week_schedules = cursor.fetchall()
-        
-            if current_week_schedules:
-                validation_issues.append(f"\nALREADY SCHEDULED FOR THIS WEEK ({len(current_week_schedules)} items):")
-                validation_issues.append("  This will clear existing schedules and regenerate.")
-        
-            # Show simplified validation results
-            if validation_issues:
-                issues_text = "\n".join(validation_issues)
-                result = messagebox.askyesno(
-                    "Quick Validation Check",
-                    f"{issues_text}\n\n"
-                    f"Continue with scheduling?\n\n"
-                    f"Note: This will proceed with enhanced duplicate prevention.",
-                    icon='info'
+            if result['success']:
+                messagebox.showinfo(
+                    "NEW SYSTEM - Scheduling Complete", 
+                    f"Generated {result['total_assignments']} PM assignments for week {week_start}\n\n"
+                    f"Unique assets: {result['unique_assets']}\n\n"
+                    f"This new system prevents duplicate assignments!"
                 )
             
-                if result:
-                    # IMPORTANT: Actually call the scheduling method
-                    self.generate_weekly_assignments()
-            
-                return result
+                # Refresh displays
+                self.refresh_technician_schedules()
+                self.update_status(f"NEW SYSTEM: Generated {result['total_assignments']} PM assignments")
             else:
-                messagebox.showinfo("Validation Passed", "No major conflicts detected. Proceeding with scheduling.")
-                # IMPORTANT: Actually call the scheduling method
-                self.generate_weekly_assignments()
-                return True
-            
-        except Exception as e:
-            messagebox.showerror("Validation Error", f"Error during validation: {str(e)}")
-            return False
-
-
-    def verify_no_duplicates(self):
-        """Verification method to check for duplicate asset assignments"""
-        try:
-            week_start = self.week_start_var.get()
-            cursor = self.conn.cursor()
-        
-            # Check for duplicate asset assignments in current week
-            cursor.execute('''
-                SELECT bfm_equipment_no, COUNT(*) as assignment_count, 
-                    GROUP_CONCAT(pm_type || ' (' || assigned_technician || ')') as assignments
-                FROM weekly_pm_schedules 
-                WHERE week_start_date = ?
-                GROUP BY bfm_equipment_no
-                HAVING COUNT(*) > 1
-            ''', (week_start,))
-        
-            duplicates = cursor.fetchall()
-        
-            if duplicates:
-                error_msg = f"DUPLICATE ASSIGNMENTS FOUND!\n\n"
-                for bfm_no, count, assignments in duplicates:
-                    error_msg += f"Asset {bfm_no}: {count} assignments\n"
-                    error_msg += f"  Details: {assignments}\n\n"
-            
-                messagebox.showerror("Duplicate Assignments Detected", error_msg)
-                return False
-            else:
-                messagebox.showinfo("Verification Passed", 
-                                f"No duplicate asset assignments found for week {week_start}")
-                return True
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to verify assignments: {str(e)}")
-            return False
-    
-    def is_pm_due(self, last_pm_date, frequency_days, current_week_start, bfm_no=None, pm_type=None):
-        """
-        Enhanced PM due date checking with comprehensive validation
-    
-        Args:
-            last_pm_date: Last completion date string
-            frequency_days: PM frequency in days (30, 180, 365)
-            current_week_start: Week start date for scheduling
-            bfm_no: Equipment number (optional, for enhanced checking)
-            pm_type: PM type (optional, for enhanced checking)
-    
-        Returns:
-            bool: True if PM is due and safe to schedule
-        """
-        try:
-            # Basic check - never done
-            if not last_pm_date:
-                return True
-        
-            # Parse the last PM date with flexible parsing
-            standardizer = DateStandardizer(self.conn)
-            parsed_date = standardizer.parse_date_flexible(last_pm_date)
-        
-            if not parsed_date:
-                print(f"DEBUG: Could not parse date '{last_pm_date}' for {bfm_no} {pm_type}")
-                return True  # If can't parse, assume it's due
-        
-            # Calculate days since last PM
-            last_date = datetime.strptime(parsed_date, '%Y-%m-%d')
-            current_date = datetime.now()
-            days_since = (current_date - last_date).days
-        
-            # Enhanced validation if equipment details provided
-            if bfm_no and pm_type:
-                cursor = self.conn.cursor()
-            
-                # Check if completed too recently (minimum 75% of frequency)
-                min_interval = max(frequency_days * 0.75, 14)
-                if days_since < min_interval:
-                    print(f"DEBUG: {bfm_no} {pm_type} PM too recent - {days_since} days (min: {min_interval})")
-                    return False
-            
-                # Check recent completion records for verification
-                cursor.execute('''
-                    SELECT completion_date 
-                    FROM pm_completions 
-                    WHERE bfm_equipment_no = ? AND pm_type = ?
-                    ORDER BY completion_date DESC LIMIT 1
-                ''', (bfm_no, pm_type))
-            
-                recent_completion = cursor.fetchone()
-                if recent_completion and recent_completion[0]:
-                    try:
-                        comp_date = datetime.strptime(recent_completion[0], '%Y-%m-%d')
-                        days_since_completion = (current_date - comp_date).days
-                    
-                        # If completion record is more recent than equipment table, use it
-                        if comp_date > last_date:
-                            days_since = days_since_completion
-                            print(f"DEBUG: Using completion record for {bfm_no} - {days_since} days since completion")
-                
-                    except Exception as e:
-                        print(f"DEBUG: Error parsing completion date: {e}")
-            
-                # Check if already scheduled recently
-                cursor.execute('''
-                    SELECT week_start_date, status 
-                    FROM weekly_pm_schedules 
-                    WHERE bfm_equipment_no = ? AND pm_type = ?
-                    AND week_start_date >= DATE(?, '-21 days')
-                    ORDER BY week_start_date DESC LIMIT 1
-                ''', (bfm_no, pm_type, current_week_start.strftime('%Y-%m-%d')))
-            
-                recent_schedule = cursor.fetchone()
-                if recent_schedule:
-                    week_date, status = recent_schedule
-                    if status == 'Completed':
-                        print(f"DEBUG: {bfm_no} {pm_type} PM already completed in week {week_date}")
-                        return False
-                    elif status == 'Scheduled' and week_date != current_week_start.strftime('%Y-%m-%d'):
-                        print(f"DEBUG: {bfm_no} {pm_type} PM already scheduled for week {week_date}")
-                        return False
-            
-            # Standard due date logic
-            next_due_date = last_date + timedelta(days=frequency_days)
-            week_end = current_week_start + timedelta(days=6)
-        
-            # PM is due if next due date is within or before current week
-            is_due = next_due_date <= week_end
-        
-            if is_due:
-                overdue_days = (current_date - next_due_date).days
-                print(f"DEBUG: {bfm_no or 'Equipment'} {pm_type or 'PM'} is due (overdue by {overdue_days} days)")
-        
-            return is_due
+                messagebox.showerror("NEW SYSTEM Error", f"Failed to generate assignments: {result['error']}")
         
         except Exception as e:
-            print(f"ERROR: Exception in is_pm_due for {bfm_no} {pm_type}: {e}")
-            # On error, assume it's due to be safe (but log the error)
-            return True
+            messagebox.showerror("NEW SYSTEM Error", f"Failed to generate assignments: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
 
-
-    def is_pm_due_simple(self, last_pm_date, frequency_days, current_week_start):
-        """
-        Simplified version for backward compatibility
-        Use this if you don't want to update all existing calls to is_pm_due
-        """
-        return self.is_pm_due(last_pm_date, frequency_days, current_week_start)
     
     def refresh_technician_schedules(self):
         """Refresh all technician schedule displays"""
@@ -11643,10 +12008,6 @@ class AITCMMSSystem:
         self.history_search_var.set('')
         self.search_pm_history_simple()
     
-    
-    
-    
-
 # Main application startup
 if __name__ == "__main__":
     root = tk.Tk()
