@@ -800,23 +800,22 @@ class MROStockManager:
         if not selected:
             messagebox.showwarning("Warning", "Please select a part to delete")
             return
-        
+
         item = self.mro_tree.item(selected[0])
-        part_number = item['values'][0]
+        part_number = str(item['values'][0])  # Convert to string
         part_name = item['values'][1]
-        
-    
+
         # Get part data to find image paths
         cursor = self.conn.cursor()
         cursor.execute('SELECT picture_1_path, picture_2_path FROM mro_inventory WHERE part_number = ?', (part_number,))
         part_data = cursor.fetchone()
-    
-        result = messagebox.askyesno("Confirm Delete", 
+
+        result = messagebox.askyesno("Confirm Delete",
                                     f"Are you sure you want to delete:\n\n"
                                     f"Part Number: {part_number}\n"
                                     f"Name: {part_name}\n\n"
                                     f"This action cannot be undone!")
-    
+
         if result:
             try:
                 # Delete associated images
@@ -828,26 +827,8 @@ class MROStockManager:
                                 os.remove(pic_path)
                             except:
                                 pass  # Ignore errors when deleting images
-            
+
                 # Delete from database
-                cursor.execute('DELETE FROM mro_inventory WHERE part_number = ?', (part_number,))
-                self.conn.commit()
-                messagebox.showinfo("Success", "Part deleted successfully!")
-                self.refresh_mro_list()
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to delete part: {str(e)}")
-        
-        
-        
-        result = messagebox.askyesno("Confirm Delete", 
-                                    f"Are you sure you want to delete:\n\n"
-                                    f"Part Number: {part_number}\n"
-                                    f"Name: {part_name}\n\n"
-                                    f"This action cannot be undone!")
-        
-        if result:
-            try:
-                cursor = self.conn.cursor()
                 cursor.execute('DELETE FROM mro_inventory WHERE part_number = ?', (part_number,))
                 self.conn.commit()
                 messagebox.showinfo("Success", "Part deleted successfully!")
@@ -861,21 +842,21 @@ class MROStockManager:
         if not selected:
             messagebox.showwarning("Warning", "Please select a part to view")
             return
-        
+
         item = self.mro_tree.item(selected[0])
-        part_number = item['values'][0]
-        
+        part_number = str(item['values'][0])  # Convert to string immediately
+
         # Get full part data
         cursor = self.conn.cursor()
         cursor.execute('SELECT * FROM mro_inventory WHERE part_number = ?', (part_number,))
         part_data = cursor.fetchone()
-        
-        # If not found, try alternative lookups
+
+        # If not found, try with stripped whitespace
         if not part_data:
-            clean_part_number = str(part_number).strip()
+            clean_part_number = part_number.strip()
             cursor.execute('SELECT * FROM mro_inventory WHERE part_number = ?', (clean_part_number,))
             part_data = cursor.fetchone()
-    
+
         if not part_data:
             messagebox.showerror("Error", f"Part not found: {part_number}")
             return
@@ -1065,15 +1046,17 @@ class MROStockManager:
     
     def stock_transaction_dialog(self, part_number):
         """Dialog for stock transactions (add/remove stock)"""
+        part_number = str(part_number)  # Ensure string type
+
         dialog = tk.Toplevel(self.root)
         dialog.title(f"Stock Transaction: {part_number}")
         dialog.geometry("500x400")
         dialog.transient(self.root)
         dialog.grab_set()
-        
+
         # Get current stock
         cursor = self.conn.cursor()
-        cursor.execute('SELECT quantity_in_stock, unit_of_measure, name FROM mro_inventory WHERE part_number = ?', 
+        cursor.execute('SELECT quantity_in_stock, unit_of_measure, name FROM mro_inventory WHERE part_number = ?',
                       (part_number,))
         result = cursor.fetchone()
         current_stock = result[0] if result else 0
