@@ -548,30 +548,54 @@ class MROStockManager:
             return
 
         item = self.mro_tree.item(selected[0])
-        part_number = item['values'][0]  # Part Number is the first column
+        part_number_raw = item['values'][0]  # Part Number is the first column
+
+        # Clean the part number - strip whitespace
+        part_number = str(part_number_raw).strip()
 
         # Debug: Print what we're trying to find
-        print(f"Looking for part number: '{part_number}' (type: {type(part_number)})")
+        print(f"Looking for part number: '{part_number}' (type: {type(part_number)}, raw: '{part_number_raw}')")
 
-        # Get full part data - use direct string comparison first
+        # Get full part data - try multiple lookup strategies
         cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM mro_inventory WHERE part_number = ?', (str(part_number),))
+
+        # Strategy 1: Exact match with cleaned string
+        cursor.execute('SELECT * FROM mro_inventory WHERE TRIM(part_number) = ?', (part_number,))
         part_data = cursor.fetchone()
 
-        # If not found, try alternative lookups
+        # Strategy 2: Case-insensitive match if not found
         if not part_data:
-            # If still not found, try to find what's actually in the treeview
-            print("Part not found in database. Checking treeview data...")
+            print("Trying case-insensitive lookup...")
+            cursor.execute('SELECT * FROM mro_inventory WHERE LOWER(TRIM(part_number)) = LOWER(?)', (part_number,))
+            part_data = cursor.fetchone()
 
-            # Get all items in treeview to debug
-            all_items = self.mro_tree.get_children()
-            for item_id in all_items:
-                item_data = self.mro_tree.item(item_id)
-                print(f"Treeview item: {item_data['values'][0]} - {item_data['values'][1]}")
+        # Strategy 3: Pattern match if still not found
+        if not part_data:
+            print("Trying pattern match...")
+            cursor.execute('SELECT * FROM mro_inventory WHERE part_number LIKE ?', (f'%{part_number}%',))
+            part_data = cursor.fetchone()
+
+        # If still not found, show detailed error
+        if not part_data:
+            print("Part not found in database. Debugging...")
+
+            # Check what's actually in the database
+            cursor.execute('SELECT COUNT(*) FROM mro_inventory')
+            total_count = cursor.fetchone()[0]
+            print(f"Total parts in database: {total_count}")
+
+            # Get a few sample part numbers to compare
+            cursor.execute('SELECT part_number FROM mro_inventory LIMIT 5')
+            samples = cursor.fetchall()
+            print(f"Sample part numbers in DB: {[s[0] for s in samples]}")
 
             messagebox.showerror("Error",
-                            f"Part not found in database: '{part_number}'\n"
-                            f"Please refresh the list and try again.")
+                            f"Part not found in database: '{part_number}'\n\n"
+                            f"This could mean:\n"
+                            f"1. The part was deleted\n"
+                            f"2. The database connection is to a different file\n"
+                            f"3. The part number has special characters\n\n"
+                            f"Please refresh the list (click Refresh button) and try again.")
             return
 
         # Create edit dialog
@@ -800,15 +824,17 @@ class MROStockManager:
         if not selected:
             messagebox.showwarning("Warning", "Please select a part to delete")
             return
-        
+
         item = self.mro_tree.item(selected[0])
-        part_number = item['values'][0]
+        part_number_raw = item['values'][0]
         part_name = item['values'][1]
-        
-    
+
+        # Clean the part number - strip whitespace
+        part_number = str(part_number_raw).strip()
+
         # Get part data to find image paths
         cursor = self.conn.cursor()
-        cursor.execute('SELECT picture_1_path, picture_2_path FROM mro_inventory WHERE part_number = ?', (part_number,))
+        cursor.execute('SELECT picture_1_path, picture_2_path FROM mro_inventory WHERE TRIM(part_number) = ?', (part_number,))
         part_data = cursor.fetchone()
     
         result = messagebox.askyesno("Confirm Delete", 
@@ -829,26 +855,8 @@ class MROStockManager:
                             except:
                                 pass  # Ignore errors when deleting images
             
-                # Delete from database
-                cursor.execute('DELETE FROM mro_inventory WHERE part_number = ?', (part_number,))
-                self.conn.commit()
-                messagebox.showinfo("Success", "Part deleted successfully!")
-                self.refresh_mro_list()
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to delete part: {str(e)}")
-        
-        
-        
-        result = messagebox.askyesno("Confirm Delete", 
-                                    f"Are you sure you want to delete:\n\n"
-                                    f"Part Number: {part_number}\n"
-                                    f"Name: {part_name}\n\n"
-                                    f"This action cannot be undone!")
-        
-        if result:
-            try:
-                cursor = self.conn.cursor()
-                cursor.execute('DELETE FROM mro_inventory WHERE part_number = ?', (part_number,))
+                # Delete from database using TRIM to ensure match
+                cursor.execute('DELETE FROM mro_inventory WHERE TRIM(part_number) = ?', (part_number,))
                 self.conn.commit()
                 messagebox.showinfo("Success", "Part deleted successfully!")
                 self.refresh_mro_list()
@@ -861,23 +869,39 @@ class MROStockManager:
         if not selected:
             messagebox.showwarning("Warning", "Please select a part to view")
             return
-        
+
         item = self.mro_tree.item(selected[0])
-        part_number = item['values'][0]
-        
-        # Get full part data
+        part_number_raw = item['values'][0]
+
+        # Clean the part number - strip whitespace
+        part_number = str(part_number_raw).strip()
+
+        # Debug: Print what we're trying to find
+        print(f"View details - Looking for part number: '{part_number}' (raw: '{part_number_raw}')")
+
+        # Get full part data - try multiple lookup strategies
         cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM mro_inventory WHERE part_number = ?', (part_number,))
+
+        # Strategy 1: Exact match with cleaned string
+        cursor.execute('SELECT * FROM mro_inventory WHERE TRIM(part_number) = ?', (part_number,))
         part_data = cursor.fetchone()
-        
-        # If not found, try alternative lookups
+
+        # Strategy 2: Case-insensitive match if not found
         if not part_data:
-            clean_part_number = str(part_number).strip()
-            cursor.execute('SELECT * FROM mro_inventory WHERE part_number = ?', (clean_part_number,))
+            print("Trying case-insensitive lookup...")
+            cursor.execute('SELECT * FROM mro_inventory WHERE LOWER(TRIM(part_number)) = LOWER(?)', (part_number,))
             part_data = cursor.fetchone()
-    
+
+        # Strategy 3: Pattern match if still not found
         if not part_data:
-            messagebox.showerror("Error", f"Part not found: {part_number}")
+            print("Trying pattern match...")
+            cursor.execute('SELECT * FROM mro_inventory WHERE part_number LIKE ?', (f'%{part_number}%',))
+            part_data = cursor.fetchone()
+
+        if not part_data:
+            messagebox.showerror("Error",
+                f"Part not found: '{part_number}'\n\n"
+                f"Please refresh the list and try again.")
             return
     
         
@@ -1065,15 +1089,18 @@ class MROStockManager:
     
     def stock_transaction_dialog(self, part_number):
         """Dialog for stock transactions (add/remove stock)"""
+        # Clean the part number
+        part_number = str(part_number).strip()
+
         dialog = tk.Toplevel(self.root)
         dialog.title(f"Stock Transaction: {part_number}")
         dialog.geometry("500x400")
         dialog.transient(self.root)
         dialog.grab_set()
-        
+
         # Get current stock
         cursor = self.conn.cursor()
-        cursor.execute('SELECT quantity_in_stock, unit_of_measure, name FROM mro_inventory WHERE part_number = ?', 
+        cursor.execute('SELECT quantity_in_stock, unit_of_measure, name FROM mro_inventory WHERE TRIM(part_number) = ?',
                       (part_number,))
         result = cursor.fetchone()
         current_stock = result[0] if result else 0
@@ -1125,9 +1152,9 @@ class MROStockManager:
                 # Update stock
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                    UPDATE mro_inventory 
+                    UPDATE mro_inventory
                     SET quantity_in_stock = ?, last_updated = ?
-                    WHERE part_number = ?
+                    WHERE TRIM(part_number) = ?
                 ''', (new_stock, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), part_number))
                 
                 # Log transaction
