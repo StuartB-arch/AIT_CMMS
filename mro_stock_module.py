@@ -562,15 +562,15 @@ class MROStockManager:
         if not part_data:
             # If still not found, try to find what's actually in the treeview
             print("Part not found in database. Checking treeview data...")
-        
+
             # Get all items in treeview to debug
             all_items = self.mro_tree.get_children()
             for item_id in all_items:
                 item_data = self.mro_tree.item(item_id)
                 print(f"Treeview item: {item_data['values'][0]} - {item_data['values'][1]}")
-        
-            messagebox.showerror("Error", 
-                            f"Part not found in database: '{part_number_from_tree}'\n"
+
+            messagebox.showerror("Error",
+                            f"Part not found in database: '{part_number}'\n"
                             f"Please refresh the list and try again.")
             return
 
