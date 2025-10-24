@@ -509,8 +509,8 @@ class MROStockManager:
         # âœ… CRITICAL: Pack canvas and scrollbar - THIS MUST BE AT THE END!
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-    
-    
+
+
     def browse_image(self, var):
         """Browse for image file and copy to application directory"""
         file_path = filedialog.askopenfilename(
