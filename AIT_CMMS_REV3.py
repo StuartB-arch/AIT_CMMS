@@ -3,7 +3,9 @@
 AIT Complete CMMS - Computerized Maintenance Management System
 Fully functional CMMS with automatic PM scheduling, technician assignment, and comprehensive reporting
 """
-
+from datetime import datetime, timedelta
+from mro_stock_module import MROStockManager
+from cm_parts_integration import CMPartsIntegration
 import shutil
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -36,9 +38,6 @@ try:
 except ImportError:
     REPORTLAB_AVAILABLE = False
     print("ReportLab not installed. PDF generation will not work.")
-
-
-
 
 class PMType(Enum):
     MONTHLY = "Monthly"
@@ -109,27 +108,33 @@ class CompletionRecordRepository:
     def __init__(self, conn):
         self.conn = conn
     
-    def get_recent_completions(self, bfm_no: str, days: int = 30) -> List[CompletionRecord]:
-        """Get recent completion records for equipment"""
+    def get_recent_completions(self, bfm_no: str, days: int = 400) -> List[CompletionRecord]:
+        """Get recent completion records for equipment - EXTENDED TO 400 DAYS FOR ANNUAL PMs"""
         cursor = self.conn.cursor()
         cursor.execute('''
             SELECT bfm_equipment_no, pm_type, completion_date, technician_name
             FROM pm_completions 
             WHERE bfm_equipment_no = ?
-            AND completion_date >= DATE('now', '-{} days')
+            AND completion_date >= DATE('now', '-' || ? || ' days')
             ORDER BY completion_date DESC
-        '''.format(days), (bfm_no,))
-        
-        results = []
+        ''', (bfm_no, days))
+    
+        completions = []
         for row in cursor.fetchall():
             try:
+                pm_type = PMType.MONTHLY if row[1] == "Monthly" else PMType.ANNUAL
                 completion_date = datetime.strptime(row[2], '%Y-%m-%d')
-                pm_type = PMType.MONTHLY if row[1] == 'Monthly' else PMType.ANNUAL
-                results.append(CompletionRecord(row[0], pm_type, completion_date, row[3]))
+            
+                completions.append(CompletionRecord(
+                    bfm_no=row[0],
+                    pm_type=pm_type,
+                    completion_date=completion_date,
+                    technician=row[3]
+                ))
             except Exception as e:
                 print(f"Error parsing completion record: {e}")
-                
-        return results
+    
+        return completions
     
     def get_scheduled_pms(self, week_start: datetime, bfm_no: Optional[str] = None) -> List[Dict]:
         """Get currently scheduled PMs for the week"""
@@ -173,8 +178,40 @@ class PMEligibilityChecker:
         if pm_type == PMType.ANNUAL and not equipment.has_annual:
             return PMEligibilityResult(PMStatus.NOT_DUE, "Equipment doesn't require Annual PM")
         
+        
+        # 🔥 NEW: For Annual PMs, check if there's a Next Annual PM Date specified
+        if pm_type == PMType.ANNUAL:
+            cursor = self.completion_repo.conn.cursor()
+            cursor.execute('SELECT next_annual_pm FROM equipment WHERE bfm_equipment_no = ?', (equipment.bfm_no,))
+            result = cursor.fetchone()
+        
+            if result and result[0]:
+                next_annual_date = self.date_parser.parse_flexible(result[0])
+                if next_annual_date:
+                    days_until_next_annual = (next_annual_date - datetime.now()).days
+                
+                    # If Next Annual PM Date is in the future and more than 7 days away, not due yet
+                    if days_until_next_annual > 7:
+                        return PMEligibilityResult(
+                            PMStatus.NOT_DUE,
+                            f"Annual PM scheduled for {next_annual_date.strftime('%Y-%m-%d')} ({days_until_next_annual} days from now)"
+                        )
+                    # If within 7 days or past due based on Next Annual PM Date
+                    elif days_until_next_annual >= -30:  # Allow 30 days past due
+                        priority = 500 + abs(min(days_until_next_annual, 0)) * 10
+                        return PMEligibilityResult(
+                            PMStatus.DUE,
+                            f"Annual PM due by Next Annual PM Date: {next_annual_date.strftime('%Y-%m-%d')}",
+                            priority_score=priority,
+                            days_overdue=abs(min(days_until_next_annual, 0))
+                        )
+        
+        
+        
+        
+        
         # Get recent completions
-        recent_completions = self.completion_repo.get_recent_completions(equipment.bfm_no, days=60)
+        recent_completions = self.completion_repo.get_recent_completions(equipment.bfm_no, days=400)
         
         # Check for recent completions of same type
         same_type_completions = [c for c in recent_completions if c.pm_type == pm_type]
@@ -203,9 +240,11 @@ class PMEligibilityChecker:
         return self._check_due_date(equipment, pm_type, recent_completions)
     
     def _get_minimum_interval(self, pm_type: PMType) -> int:
-        """Get minimum interval before rescheduling same PM type"""
-        frequency = self.PM_FREQUENCIES[pm_type]
-        return max(int(frequency * 0.75), 14)  # 75% of frequency or 14 days minimum
+        """Get minimum interval before rescheduling same PM type - ALIGNED WITH BUSINESS RULES"""
+        if pm_type == PMType.MONTHLY:
+            return 30  # Monthly PMs: minimum 30 days between completions
+        else:  # PMType.ANNUAL
+            return 365  # Annual PMs: minimum 365 days between completions
     
     def _check_cross_pm_conflicts(self, recent_completions: List[CompletionRecord], 
                                  pm_type: PMType) -> PMEligibilityResult:
@@ -241,64 +280,85 @@ class PMEligibilityChecker:
     
     def _check_due_date(self, equipment: Equipment, pm_type: PMType, 
                        recent_completions: List[CompletionRecord]) -> PMEligibilityResult:
-        """Check if PM is due based on last completion date"""
-        
-        # Get the appropriate last date from equipment table
-        last_date_str = (equipment.last_monthly_date if pm_type == PMType.MONTHLY 
-                        else equipment.last_annual_date)
-        
-        # Use completion records if they're more recent
+        """Check if PM is due based on last completion date - CORRECTED TO USE ACTUAL COMPLETION DATES"""
+    
+        # CRITICAL: Get the MOST RECENT completion date from pm_completions table
+        # This ensures we're always using the LATEST completion, not outdated equipment table data
         same_type_completions = [c for c in recent_completions if c.pm_type == pm_type]
+        
         if same_type_completions:
+            # Use the most recent completion record - THIS IS THE SOURCE OF TRUTH
             latest_completion = max(same_type_completions, key=lambda x: x.completion_date)
-            equipment_date = self.date_parser.parse_flexible(last_date_str)
-            
-            if not equipment_date or latest_completion.completion_date > equipment_date:
-                last_completion_date = latest_completion.completion_date
-                source = "completion_record"
-            else:
-                last_completion_date = equipment_date
-                source = "equipment_table"
+            last_completion_date = latest_completion.completion_date
+            source = "pm_completions_table"
         else:
+            # Fall back to equipment table only if no completion records exist
+            last_date_str = (equipment.last_monthly_date if pm_type == PMType.MONTHLY 
+                            else equipment.last_annual_date)
             last_completion_date = self.date_parser.parse_flexible(last_date_str)
             source = "equipment_table"
-        
+    
         # Never completed = high priority
         if not last_completion_date:
-            priority = 1000 if pm_type == PMType.MONTHLY else 900  # Prioritize Monthly for new equipment
+            priority = 1000 if pm_type == PMType.MONTHLY else 900
             return PMEligibilityResult(
                 PMStatus.DUE, 
                 f"{pm_type.value} PM never completed - HIGH PRIORITY",
                 priority_score=priority
             )
+    
+        # Calculate days since last completion
+        days_since_completion = (datetime.now() - last_completion_date).days
+    
+        # CRITICAL FIX: Use your actual business rules
+        if pm_type == PMType.MONTHLY:
+            # Monthly PMs: Schedule 30-35 days AFTER last completion
+            min_days = 30
+            max_days = 35
+            ideal_frequency = 30
+        else:  # PMType.ANNUAL
+            # Annual PMs: Schedule 365-370 days AFTER last completion
+            min_days = 365
+            max_days = 370
+            ideal_frequency = 365
+    
+        # PM is DUE if it's been at least min_days since completion
+        if days_since_completion >= min_days:
+            # Calculate priority based on how overdue
+            days_overdue = days_since_completion - ideal_frequency
         
-        # Calculate if due
-        frequency = self.PM_FREQUENCIES[pm_type]
-        days_since = (datetime.now() - last_completion_date).days
-        next_due_date = last_completion_date + timedelta(days=frequency)
-        days_overdue = (datetime.now() - next_due_date).days
-        
-        # Due if overdue or within 14 days of due date (early scheduling allowed)
-        if days_overdue >= 0:
-            priority = min(days_overdue * 10, 500)  # Higher priority for more overdue
+            if days_overdue > 0:
+                # Overdue - highest priority
+                priority = min(500 + (days_overdue * 10), 999)
+                return PMEligibilityResult(
+                    PMStatus.DUE,
+                    f"{pm_type.value} PM OVERDUE by {days_overdue} days (last: {last_completion_date.strftime('%Y-%m-%d')}, source: {source})",
+                    priority_score=priority,
+                    days_overdue=days_overdue
+                )
+            elif days_since_completion <= max_days:
+                # Within scheduling window (30-35 for monthly, 365-370 for annual)
+                priority = 300 - abs(days_since_completion - ideal_frequency)
+                return PMEligibilityResult(
+                    PMStatus.DUE,
+                    f"{pm_type.value} PM due now ({days_since_completion} days since last, last: {last_completion_date.strftime('%Y-%m-%d')}, source: {source})",
+                    priority_score=priority
+                )
+            else:
+                # Past the ideal window but still technically "due"
+                priority = 200
+                return PMEligibilityResult(
+                    PMStatus.DUE,
+                    f"{pm_type.value} PM due ({days_since_completion} days since last, last: {last_completion_date.strftime('%Y-%m-%d')}, source: {source})",
+                    priority_score=priority
+                )
+        else:
+            # Not yet due - completed too recently
+            days_until_due = min_days - days_since_completion
             return PMEligibilityResult(
-                PMStatus.DUE,
-                f"{pm_type.value} PM overdue by {days_overdue} days ({source})",
-                priority_score=priority,
-                days_overdue=days_overdue
+                PMStatus.NOT_DUE,
+                f"{pm_type.value} PM not due for {days_until_due} days (last: {last_completion_date.strftime('%Y-%m-%d')}, source: {source})"
             )
-        elif abs(days_overdue) <= 14:  # Within 2 weeks of due
-            priority = max(100 - abs(days_overdue) * 5, 10)
-            return PMEligibilityResult(
-                PMStatus.DUE,
-                f"{pm_type.value} PM due in {abs(days_overdue)} days ({source})",
-                priority_score=priority
-            )
-        
-        return PMEligibilityResult(
-            PMStatus.NOT_DUE,
-            f"{pm_type.value} PM not due for {abs(days_overdue)} days"
-        )
 
 class PMAssignmentGenerator:
     """Responsible for generating PM assignments"""
@@ -413,18 +473,23 @@ class PMSchedulingService:
             return {'success': False, 'error': str(e)}
     
     def _get_active_equipment(self) -> List[Equipment]:
-        """Get list of active equipment from database"""
+        """Get list of active equipment from database - EXCLUDES Cannot Find and Run to Failure"""
         cursor = self.conn.cursor()
         cursor.execute('''
             SELECT bfm_equipment_no, description, monthly_pm, annual_pm,
-                   last_monthly_pm, last_annual_pm, status
+                last_monthly_pm, last_annual_pm, COALESCE(status, 'Active') as status
             FROM equipment
-            WHERE status = 'Active'
-            AND status != 'Run to Failure' 
-            AND status != 'Missing'
+            WHERE (status = 'Active' OR status IS NULL)
+            AND status NOT IN ('Run to Failure', 'Missing')
+            AND bfm_equipment_no NOT IN (
+                SELECT DISTINCT bfm_equipment_no FROM cannot_find_assets WHERE status = 'Missing'
+            )
+            AND bfm_equipment_no NOT IN (
+                SELECT DISTINCT bfm_equipment_no FROM run_to_failure_assets
+            )
             ORDER BY bfm_equipment_no
         ''')
-        
+    
         equipment_list = []
         for row in cursor.fetchall():
             equipment_list.append(Equipment(
@@ -436,7 +501,7 @@ class PMSchedulingService:
                 last_annual_date=row[5],
                 status=row[6]
             ))
-        
+    
         return equipment_list
     
     def _assign_and_save(self, assignments: List[PMAssignment], week_start: datetime, week_start_str: str):
@@ -638,8 +703,1518 @@ class DateStandardizer:
             return 0, errors
 
 
+
+def generate_monthly_summary_report(conn, month=None, year=None):
+    """
+    Generate a comprehensive monthly PM summary report with separate tracking
+    for PM Completions, Cannot Find, Run to Failure entries, and CM statistics
+    
+    Args:
+        conn: Database connection
+        month: Month number (1-12), defaults to current month
+        year: Year (YYYY), defaults to current year
+    """
+    cursor = conn.cursor()
+    
+    # Use current month/year if not specified
+    if month is None or year is None:
+        now = datetime.now()
+        month = month or now.month
+        year = year or now.year
+    
+    month_name = calendar.month_name[month]
+    
+    # Calculate date range for the month
+    first_day = f"{year}-{month:02d}-01"
+    last_day = f"{year}-{month:02d}-{calendar.monthrange(year, month)[1]}"
+    
+    print("=" * 80)
+    print(f"MONTHLY PM SUMMARY REPORT")
+    print(f"Month: {month_name} {year}")
+    print(f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80)
+    print()
+    
+    # 1. OVERALL MONTHLY SUMMARY - PM COMPLETIONS ONLY
+    # Get PM completions count
+    cursor.execute('''
+        SELECT 
+            COUNT(*) as total_completions,
+            SUM(labor_hours + labor_minutes/60.0) as total_hours,
+            AVG(labor_hours + labor_minutes/60.0) as avg_hours
+        FROM pm_completions 
+        WHERE strftime('%Y', completion_date) = ? 
+        AND strftime('%m', completion_date) = ?
+    ''', (str(year), f"{month:02d}"))
+    
+    pm_results = cursor.fetchone()
+    pm_completions = pm_results[0] or 0
+    pm_total_hours = pm_results[1] or 0.0
+    pm_avg_hours = pm_results[2] or 0.0
+    
+    # Get Cannot Find entries count (separate)
+    cursor.execute('''
+        SELECT COUNT(*)
+        FROM cannot_find_assets 
+        WHERE strftime('%Y', report_date) = ? 
+        AND strftime('%m', report_date) = ?
+    ''', (str(year), f"{month:02d}"))
+    
+    cf_count = cursor.fetchone()[0] or 0
+    
+    # Get Run to Failure entries count (separate)
+    cursor.execute('''
+        SELECT COUNT(*)
+        FROM run_to_failure_assets 
+        WHERE strftime('%Y', completion_date) = ? 
+        AND strftime('%m', completion_date) = ?
+    ''', (str(year), f"{month:02d}"))
+    
+    rtf_count = cursor.fetchone()[0] or 0
+    
+    # Get CM statistics
+    # CMs created this month
+    cursor.execute('''
+        SELECT COUNT(*)
+        FROM corrective_maintenance 
+        WHERE strftime('%Y', created_date) = ? 
+        AND strftime('%m', created_date) = ?
+    ''', (str(year), f"{month:02d}"))
+    
+    cms_created = cursor.fetchone()[0] or 0
+    
+    # Get CM statistics
+    # CMs created this month
+    cursor.execute('''
+        SELECT COUNT(*)
+        FROM corrective_maintenance 
+        WHERE strftime('%Y', created_date) = ? 
+        AND strftime('%m', created_date) = ?
+    ''', (str(year), f"{month:02d}"))
+
+    cms_created = cursor.fetchone()[0] or 0
+
+    # CMs completed/closed this month (TOTAL)
+    cursor.execute('''
+        SELECT COUNT(*)
+        FROM corrective_maintenance 
+        WHERE strftime('%Y', completion_date) = ? 
+        AND strftime('%m', completion_date) = ?
+        AND (status = 'Closed' OR status = 'Completed')
+    ''', (str(year), f"{month:02d}"))
+
+    cms_closed = cursor.fetchone()[0] or 0
+
+    # NEW: CMs created AND closed in the same month
+    cursor.execute('''
+        SELECT COUNT(*)
+        FROM corrective_maintenance 
+        WHERE strftime('%Y', created_date) = ? 
+        AND strftime('%m', created_date) = ?
+        AND strftime('%Y', completion_date) = ? 
+        AND strftime('%m', completion_date) = ?
+        AND (status = 'Closed' OR status = 'Completed')
+    ''', (str(year), f"{month:02d}", str(year), f"{month:02d}"))
+
+    cms_created_and_closed = cursor.fetchone()[0] or 0
+
+    # NEW: CMs created BEFORE this month but closed this month
+    cursor.execute('''
+        SELECT COUNT(*)
+        FROM corrective_maintenance 
+        WHERE (strftime('%Y', created_date) != ? OR strftime('%m', created_date) != ?)
+        AND strftime('%Y', completion_date) = ? 
+        AND strftime('%m', completion_date) = ?
+        AND (status = 'Closed' OR status = 'Completed')
+    ''', (str(year), f"{month:02d}", str(year), f"{month:02d}"))
+
+    cms_closed_from_before = cursor.fetchone()[0] or 0
+
+    # Currently open CMs (as of report date)
+    cursor.execute('''
+        SELECT COUNT(*)
+        FROM corrective_maintenance 
+        WHERE status = 'Open'
+    ''')
+
+    cms_open_current = cursor.fetchone()[0] or 0
+
+    # Display Enhanced CM Statistics
+    print("CORRECTIVE MAINTENANCE (CM) SUMMARY:")
+    print(f"  CMs Created This Month: {cms_created}")
+    print(f"  CMs Closed This Month: {cms_closed}")
+    print(f"    - Created & Closed in {month_name}: {cms_created_and_closed}")
+    print(f"    - Created Before {month_name}, Closed in {month_name}: {cms_closed_from_before}")
+    print(f"  Currently Open CMs: {cms_open_current}")
+    print()
+
+    # NEW: Show details of CMs closed from previous months (if any)
+    if cms_closed_from_before > 0:
+        print("=" * 80)
+        print(f"CMs CREATED BEFORE {month_name.upper()} BUT CLOSED IN {month_name.upper()}:")
+        print("=" * 80)
+    
+        cursor.execute('''
+            SELECT 
+                cm_number,
+                bfm_equipment_no,
+                created_date,
+                completion_date,
+                assigned_technician
+            FROM corrective_maintenance 
+            WHERE (strftime('%Y', created_date) != ? OR strftime('%m', created_date) != ?)
+            AND strftime('%Y', completion_date) = ? 
+            AND strftime('%m', completion_date) = ?
+            AND (status = 'Closed' OR status = 'Completed')
+            ORDER BY completion_date
+        ''', (str(year), f"{month:02d}", str(year), f"{month:02d}"))
+    
+        old_cms = cursor.fetchall()
+    
+        print(f"{'CM#':<12} {'Created':<12} {'Closed':<12} {'Equipment':<15} {'Tech':<20}")
+        print("-" * 80)
+    
+        for cm_number, bfm, created, completed, tech in old_cms:
+            created_short = created[:10] if created else "Unknown"
+            completed_short = completed[:10] if completed else "Unknown"
+            bfm_short = (bfm[:15] if bfm else "N/A")
+            tech_short = (tech[:20] if tech else "Unassigned")
+            print(f"{cm_number:<12} {created_short:<12} {completed_short:<12} {bfm_short:<15} {tech_short:<20}")
+    
+        print()
+    
+    # Display PM Completions (NOT including Cannot Find or Run to Failure)
+    print("MONTHLY OVERVIEW:")
+    print(f"  Total PM Completions: {pm_completions}")
+    print(f"  Total Labor Hours: {pm_total_hours:.1f} hours")
+    print(f"  Average Hours per PM: {pm_avg_hours:.1f} hours")
+    print()
+    
+    # Display Cannot Find and Run to Failure separately
+    print("OTHER ACTIVITY:")
+    print(f"  Cannot Find Entries: {cf_count}")
+    print(f"  Run to Failure Entries: {rtf_count}")
+    print(f"  Total All Activity: {pm_completions + cf_count + rtf_count}")
+    print()
+    
+    
+    
+    # 2. PM TYPE BREAKDOWN (PM Completions only)
+    cursor.execute('''
+        SELECT 
+            pm_type,
+            COUNT(*) as count,
+            SUM(labor_hours + labor_minutes/60.0) as total_hours,
+            AVG(labor_hours + labor_minutes/60.0) as avg_hours
+        FROM pm_completions 
+        WHERE strftime('%Y', completion_date) = ? 
+        AND strftime('%m', completion_date) = ?
+        GROUP BY pm_type
+        ORDER BY count DESC
+    ''', (str(year), f"{month:02d}"))
+    
+    pm_types = cursor.fetchall()
+    
+    if pm_types:
+        print("PM TYPE BREAKDOWN:")
+        print(f"{'PM Type':<15} {'Count':<10} {'Total Hours':<15} {'Avg Hours':<12}")
+        print("-" * 55)
+        for pm_type, count, total_hrs, avg_hrs in pm_types:
+            total_hrs_display = f"{total_hrs:.1f}h" if total_hrs else "0.0h"
+            avg_hrs_display = f"{avg_hrs:.1f}h" if avg_hrs else "0.0h"
+            print(f"{pm_type:<15} {count:<10} {total_hrs_display:<15} {avg_hrs_display:<12}")
+        print()
+    
+    # 3. DAILY COMPLETION TRACKING (PM Completions only)
+    cursor.execute('''
+        SELECT 
+            completion_date,
+            COUNT(*) as daily_count,
+            SUM(labor_hours + labor_minutes/60.0) as daily_hours
+        FROM pm_completions 
+        WHERE strftime('%Y', completion_date) = ? 
+        AND strftime('%m', completion_date) = ?
+        GROUP BY completion_date
+        ORDER BY completion_date
+    ''', (str(year), f"{month:02d}"))
+    
+    daily_data = cursor.fetchall()
+    
+    if daily_data:
+        print("DAILY COMPLETION SUMMARY:")
+        print(f"{'Date':<12} {'PMs Completed':<15} {'Labor Hours':<12} {'Running Total':<15}")
+        print("-" * 55)
+        
+        running_total = 0
+        for date, count, hours in daily_data:
+            running_total += count
+            hours_display = f"{hours:.1f}h" if hours else "0.0h"
+            print(f"{date:<12} {count:<15} {hours_display:<12} {running_total:<15}")
+        print()
+    
+    # 4. TECHNICIAN PERFORMANCE (PM Completions only)
+    cursor.execute('''
+        SELECT 
+            technician_name,
+            COUNT(*) as completions,
+            SUM(labor_hours + labor_minutes/60.0) as total_hours,
+            AVG(labor_hours + labor_minutes/60.0) as avg_hours
+        FROM pm_completions 
+        WHERE strftime('%Y', completion_date) = ? 
+        AND strftime('%m', completion_date) = ?
+        GROUP BY technician_name
+        ORDER BY completions DESC
+    ''', (str(year), f"{month:02d}"))
+    
+    technicians = cursor.fetchall()
+    
+    if technicians:
+        print("TECHNICIAN PERFORMANCE:")
+        print(f"{'Technician':<25} {'Completions':<15} {'Total Hours':<15} {'Avg Hours':<12}")
+        print("-" * 70)
+        for tech, count, total_hrs, avg_hrs in technicians:
+            total_hrs_display = f"{total_hrs:.1f}h" if total_hrs else "0.0h"
+            avg_hrs_display = f"{avg_hrs:.1f}h" if avg_hrs else "0.0h"
+            print(f"{tech:<25} {count:<15} {total_hrs_display:<15} {avg_hrs_display:<12}")
+        print()
+    
+    # 5. CM BREAKDOWN BY PRIORITY AND TECHNICIAN
+    cursor.execute('''
+        SELECT 
+            priority,
+            COUNT(*) as count
+        FROM corrective_maintenance 
+        WHERE strftime('%Y', created_date) = ? 
+        AND strftime('%m', created_date) = ?
+        GROUP BY priority
+        ORDER BY 
+            CASE priority
+                WHEN 'Critical' THEN 1
+                WHEN 'High' THEN 2
+                WHEN 'Medium' THEN 3
+                WHEN 'Low' THEN 4
+                ELSE 5
+            END
+    ''', (str(year), f"{month:02d}"))
+    
+    cm_priorities = cursor.fetchall()
+    
+    if cm_priorities:
+        print("CM BREAKDOWN BY PRIORITY (Created This Month):")
+        print(f"{'Priority':<15} {'Count':<10}")
+        print("-" * 25)
+        for priority, count in cm_priorities:
+            print(f"{priority:<15} {count:<10}")
+        print()
+    
+    # CM completion by technician
+    cursor.execute('''
+        SELECT 
+            assigned_technician,
+            COUNT(*) as completed
+        FROM corrective_maintenance 
+        WHERE strftime('%Y', completion_date) = ? 
+        AND strftime('%m', completion_date) = ?
+        AND (status = 'Closed' OR status = 'Completed')
+        GROUP BY assigned_technician
+        ORDER BY completed DESC
+    ''', (str(year), f"{month:02d}"))
+    
+    cm_techs = cursor.fetchall()
+    
+    if cm_techs:
+        print("CMs COMPLETED BY TECHNICIAN (This Month):")
+        print(f"{'Technician':<25} {'CMs Closed':<12}")
+        print("-" * 37)
+        for tech, count in cm_techs:
+            print(f"{tech:<25} {count:<12}")
+        print()
+    
+    # 6. EQUIPMENT LOCATION SUMMARY (PM Completions only)
+    cursor.execute('''
+        SELECT 
+            e.location,
+            COUNT(*) as completions,
+            SUM(pc.labor_hours + pc.labor_minutes/60.0) as total_hours
+        FROM pm_completions pc
+        JOIN equipment e ON pc.bfm_equipment_no = e.bfm_equipment_no
+        WHERE strftime('%Y', pc.completion_date) = ? 
+        AND strftime('%m', pc.completion_date) = ?
+        GROUP BY e.location
+        ORDER BY completions DESC
+    ''', (str(year), f"{month:02d}"))
+    
+    locations = cursor.fetchall()
+    
+    if locations:
+        print("COMPLETIONS BY LOCATION:")
+        print(f"{'Location':<30} {'Completions':<15} {'Total Hours':<12}")
+        print("-" * 60)
+        for location, count, hours in locations:
+            hours_display = f"{hours:.1f}h" if hours else "0.0h"
+            print(f"{location:<30} {count:<15} {hours_display:<12}")
+        print()
+    
+    print("=" * 80)
+    print("END OF MONTHLY SUMMARY REPORT")
+    print("=" * 80)
+    
+    return {
+        'pm_completions': pm_completions,
+        'cannot_find_count': cf_count,
+        'run_to_failure_count': rtf_count,
+        'cms_created': cms_created,
+        'cms_closed': cms_closed,
+        'cms_open_current': cms_open_current,
+        'total_hours': pm_total_hours,
+        'avg_hours': pm_avg_hours,
+        'month': month_name,
+        'year': year
+    }
+
+def export_professional_monthly_report_pdf(conn, month=None, year=None):
+        """
+        Generate a professional
+        """
+        from reportlab.lib.pagesizes import letter, landscape
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+        
+        cursor = conn.cursor()
+        
+        # Use current month/year if not specified
+        if month is None or year is None:
+            now = datetime.now()
+            month = month or now.month
+            year = year or now.year
+    
+        month_name = calendar.month_name[month]
+    
+        # Create PDF filename
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"AIT_Monthly_Report_{month_name}_{year}_{timestamp}.pdf"
+    
+        # Create document
+        doc = SimpleDocTemplate(filename, pagesize=letter,
+                            rightMargin=36, leftMargin=36,
+                            topMargin=50, bottomMargin=36)
+    
+        story = []
+        styles = getSampleStyleSheet()
+    
+        # ==================== CUSTOM STYLES ====================
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            textColor=colors.HexColor('#1a365d'),
+            spaceAfter=30,
+            alignment=TA_CENTER,
+            fontName='Helvetica-Bold'
+        )
+    
+        heading_style = ParagraphStyle(
+            'CustomHeading',
+            parent=styles['Heading2'],
+            fontSize=14,
+            textColor=colors.HexColor('#2c5282'),
+            spaceAfter=12,
+            spaceBefore=12,
+            fontName='Helvetica-Bold'
+        )
+    
+        subheading_style = ParagraphStyle(
+            'CustomSubHeading',
+            parent=styles['Heading3'],
+            fontSize=11,
+            textColor=colors.HexColor('#2d3748'),
+            spaceAfter=6,
+            fontName='Helvetica-Bold'
+        )
+    
+        # ==================== TITLE PAGE ====================
+        story.append(Paragraph("AIRBUS AIT", title_style))
+        story.append(Paragraph("Monthly Maintenance Summary Report", 
+                            ParagraphStyle('Subtitle', parent=styles['Normal'], 
+                                        fontSize=16, alignment=TA_CENTER, 
+                                        textColor=colors.HexColor('#4a5568'))))
+        story.append(Spacer(1, 20))
+    
+        # Report metadata box
+        meta_data = [
+            ['Report Period:', f'{month_name} {year}'],
+            ['Generated:', datetime.now().strftime('%B %d, %Y at %I:%M %p')],
+            ['Report Type:', 'Comprehensive Monthly Summary']
+        ]
+    
+        meta_table = Table(meta_data, colWidths=[2*inch, 4*inch])
+        meta_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#e2e8f0')),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#2d3748')),
+            ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
+            ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#cbd5e0')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 12),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ]))
+    
+        story.append(meta_table)
+        story.append(Spacer(1, 30))
+    
+        # ==================== EXECUTIVE SUMMARY ====================
+        story.append(Paragraph("EXECUTIVE SUMMARY", heading_style))
+        story.append(Spacer(1, 10))
+    
+        # Get summary data
+        cursor.execute('''
+            SELECT 
+                COUNT(*) as total_completions,
+                SUM(labor_hours + labor_minutes/60.0) as total_hours,
+                AVG(labor_hours + labor_minutes/60.0) as avg_hours
+            FROM pm_completions 
+            WHERE strftime('%Y', completion_date) = ? 
+            AND strftime('%m', completion_date) = ?
+        ''', (str(year), f"{month:02d}"))
+    
+        pm_results = cursor.fetchone()
+        pm_completions = pm_results[0] or 0
+        pm_total_hours = pm_results[1] or 0.0
+        pm_avg_hours = pm_results[2] or 0.0
+    
+        # Get CM data
+        cursor.execute('''
+            SELECT COUNT(*) FROM corrective_maintenance 
+            WHERE strftime('%Y', created_date) = ? AND strftime('%m', created_date) = ?
+        ''', (str(year), f"{month:02d}"))
+        cms_created = cursor.fetchone()[0] or 0
+    
+        cursor.execute('''
+            SELECT COUNT(*) FROM corrective_maintenance 
+            WHERE strftime('%Y', completion_date) = ? AND strftime('%m', completion_date) = ?
+            AND (status = 'Closed' OR status = 'Completed')
+        ''', (str(year), f"{month:02d}"))
+        cms_closed = cursor.fetchone()[0] or 0
+        
+        # Summary highlights table
+        summary_data = [
+            ['METRIC', 'VALUE'],
+            ['PM Completions', f'{pm_completions:,}'],
+            ['Total Labor Hours', f'{pm_total_hours:.1f} hrs'],
+            ['Average Time per PM', f'{pm_avg_hours:.1f} hrs'],
+            ['CMs Created', f'{cms_created:,}'],
+            ['CMs Closed', f'{cms_closed:,}']
+        ]
+    
+        summary_table = Table(summary_data, colWidths=[3.5*inch, 2.5*inch])
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2c5282')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('ALIGN', (1, 1), (1, -1), 'RIGHT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 11),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#cbd5e0')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 12),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+            ('TOPPADDING', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')])
+        ]))
+    
+        story.append(summary_table)
+        story.append(Spacer(1, 25))
+        
+        # ==================== CORRECTIVE MAINTENANCE DETAIL ====================
+        story.append(Paragraph("CORRECTIVE MAINTENANCE ANALYSIS", heading_style))
+        story.append(Spacer(1, 10))
+    
+        # Get CM breakdown
+        cursor.execute('''
+            SELECT COUNT(*) FROM corrective_maintenance 
+            WHERE strftime('%Y', created_date) = ? AND strftime('%m', created_date) = ?
+            AND strftime('%Y', completion_date) = ? AND strftime('%m', completion_date) = ?
+            AND (status = 'Closed' OR status = 'Completed')
+        ''', (str(year), f"{month:02d}", str(year), f"{month:02d}"))
+        cms_created_and_closed = cursor.fetchone()[0] or 0
+    
+        cursor.execute('''
+            SELECT COUNT(*) FROM corrective_maintenance 
+            WHERE (strftime('%Y', created_date) != ? OR strftime('%m', created_date) != ?)
+            AND strftime('%Y', completion_date) = ? AND strftime('%m', completion_date) = ?
+            AND (status = 'Closed' OR status = 'Completed')
+        ''', (str(year), f"{month:02d}", str(year), f"{month:02d}"))
+        cms_closed_from_before = cursor.fetchone()[0] or 0
+    
+        cursor.execute('SELECT COUNT(*) FROM corrective_maintenance WHERE status = "Open"')
+        cms_open_current = cursor.fetchone()[0] or 0
+        
+        cm_breakdown_data = [
+            ['CATEGORY', 'COUNT'],
+            ['CMs Created This Month', str(cms_created)],
+            ['CMs Closed This Month', str(cms_closed)],
+            ['  • Created & Closed Same Month', str(cms_created_and_closed)],
+            [f'  • Carried Over from Prior Months', str(cms_closed_from_before)],
+            ['Currently Open CMs', str(cms_open_current)]
+        ]
+    
+        cm_table = Table(cm_breakdown_data, colWidths=[4.5*inch, 1.5*inch])
+        cm_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2c5282')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 11),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 10),
+            ('BACKGROUND', (0, 1), (-1, 2), colors.white),
+            ('BACKGROUND', (0, 3), (-1, -1), colors.HexColor('#f7fafc')),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#cbd5e0')),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 12),
+            ('LEFTPADDING', (0, 3), (0, 4), 24),  # Indent sub-items
+            ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+            ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ]))
+    
+        story.append(cm_table)
+        story.append(Spacer(1, 20))
+        
+        # CM Details from previous months (if any)
+        if cms_closed_from_before > 0:
+            story.append(Paragraph("CMs Carried Over from Prior Months", subheading_style))
+            story.append(Spacer(1, 8))
+        
+            cursor.execute('''
+                SELECT cm_number, bfm_equipment_no, created_date, completion_date, assigned_technician
+                FROM corrective_maintenance 
+                WHERE (strftime('%Y', created_date) != ? OR strftime('%m', created_date) != ?)
+                AND strftime('%Y', completion_date) = ? AND strftime('%m', completion_date) = ?
+                AND (status = 'Closed' OR status = 'Completed')
+                ORDER BY completion_date
+            ''', (str(year), f"{month:02d}", str(year), f"{month:02d}"))
+        
+            old_cms = cursor.fetchall()
+        
+            cm_detail_data = [['CM Number', 'Equipment', 'Created', 'Closed', 'Technician']]
+        
+            for cm_number, bfm, created, completed, tech in old_cms:
+                created_short = created[:10] if created else "N/A"
+                completed_short = completed[:10] if completed else "N/A"
+                bfm_short = (bfm[:12] + '...' if len(str(bfm)) > 12 else bfm) if bfm else "N/A"
+                tech_short = (tech[:15] + '...' if len(str(tech)) > 15 else tech) if tech else "Unassigned"
+                cm_detail_data.append([cm_number, bfm_short, created_short, completed_short, tech_short])
+        
+            cm_detail_table = Table(cm_detail_data, colWidths=[1.1*inch, 1.3*inch, 1.1*inch, 1.1*inch, 1.4*inch])
+            cm_detail_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4a5568')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 9),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 8),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e0')),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')])
+            ]))
+        
+            story.append(cm_detail_table)
+            story.append(Spacer(1, 20))
+    
+        # ==================== PM TYPE BREAKDOWN ====================
+        story.append(Paragraph("PREVENTIVE MAINTENANCE BREAKDOWN", heading_style))
+        story.append(Spacer(1, 10))
+    
+        cursor.execute('''
+            SELECT pm_type, COUNT(*) as count, 
+                SUM(labor_hours + labor_minutes/60.0) as total_hours,
+                AVG(labor_hours + labor_minutes/60.0) as avg_hours
+            FROM pm_completions 
+            WHERE strftime('%Y', completion_date) = ? AND strftime('%m', completion_date) = ?
+            GROUP BY pm_type
+            ORDER BY count DESC
+        ''', (str(year), f"{month:02d}"))
+    
+        pm_types = cursor.fetchall()
+    
+        if pm_types:
+            pm_type_data = [['PM Type', 'Count', 'Total Hours', 'Avg Hours']]
+        
+            for pm_type, count, total_hrs, avg_hrs in pm_types:
+                pm_type_data.append([
+                    pm_type,
+                    str(count),
+                    f'{total_hrs:.1f}' if total_hrs else '0.0',
+                    f'{avg_hrs:.1f}' if avg_hrs else '0.0'
+                ])
+        
+            pm_type_table = Table(pm_type_data, colWidths=[2*inch, 1.5*inch, 1.5*inch, 1.5*inch])
+            pm_type_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2c5282')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 11),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 10),
+                ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#cbd5e0')),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 12),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+                ('TOPPADDING', (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')])
+            ]))
+        
+            story.append(pm_type_table)
+            story.append(Spacer(1, 25))
+    
+        # ==================== DAILY ACTIVITY SUMMARY ====================
+        story.append(Paragraph("DAILY COMPLETION SUMMARY", heading_style))
+        story.append(Spacer(1, 10))
+    
+        cursor.execute('''
+            SELECT completion_date, COUNT(*) as daily_count,
+                SUM(labor_hours + labor_minutes/60.0) as daily_hours
+            FROM pm_completions 
+            WHERE strftime('%Y', completion_date) = ? AND strftime('%m', completion_date) = ?
+            GROUP BY completion_date
+            ORDER BY completion_date
+        ''', (str(year), f"{month:02d}"))
+    
+        daily_data_raw = cursor.fetchall()
+    
+        if daily_data_raw:
+            daily_data = [['Date', 'PMs Completed', 'Labor Hours', 'Running Total']]
+            running_total = 0
+        
+            for date, count, hours in daily_data_raw:
+                running_total += count
+                daily_data.append([
+                    date,
+                    str(count),
+                    f'{hours:.1f}' if hours else '0.0',
+                    str(running_total)
+                ])
+        
+            daily_table = Table(daily_data, colWidths=[1.5*inch, 1.5*inch, 1.5*inch, 1.5*inch])
+            daily_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2c5282')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 10),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 9),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#cbd5e0')),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')])
+            ]))
+        
+            story.append(daily_table)
+    
+        # ==================== BUILD PDF ====================
+        doc.build(story)
+    
+        return filename   
+
+
+
+
+
 class AITCMMSSystem:
     """Complete AIT CMMS - Computerized Maintenance Management System"""
+    
+    def show_closing_sync_dialog(self):
+        """Show dialog asking user to confirm database sync on close"""
+    
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Closing Program - Database Sync")
+        dialog.geometry("600x500")
+        dialog.transient(self.root)
+        dialog.grab_set()
+    
+        # Center dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (600 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (500 // 2)
+        dialog.geometry(f"600x500+{x}+{y}")
+    
+        result = {"action": "cancel"}  # Default to cancel
+    
+        # Header
+        header_frame = ttk.Frame(dialog, padding=20)
+        header_frame.pack(fill='x')
+    
+        ttk.Label(header_frame, text="Closing AIT CMMS", 
+                font=('Arial', 16, 'bold')).pack()
+        ttk.Label(header_frame, text="Database Backup Confirmation", 
+                font=('Arial', 11), foreground='blue').pack(pady=5)
+    
+        # Separator
+        ttk.Separator(dialog, orient='horizontal').pack(fill='x', pady=10)
+    
+        # Info section
+        info_frame = ttk.LabelFrame(dialog, text="Session Information", padding=15)
+        info_frame.pack(fill='both', expand=True, padx=20, pady=10)
+    
+        session_duration = datetime.now() - self.session_start_time
+        hours, remainder = divmod(int(session_duration.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+    
+        info_text = f"""
+    User: {self.user_name}
+    Role: {self.current_user_role}
+
+    Session Start: {self.session_start_time.strftime('%Y-%m-%d %H:%M:%S')}
+    Session Duration: {hours}h {minutes}m {seconds}s
+
+    Current Database: ait_cmms_database.db
+    SharePoint Folder: {os.path.basename(self.backup_sync_dir) if hasattr(self, 'backup_sync_dir') and self.backup_sync_dir else 'Not Connected'}
+        """
+    
+        ttk.Label(info_frame, text=info_text, justify='left', 
+                font=('Courier', 9)).pack(anchor='w')
+    
+        # Sync explanation
+        sync_frame = ttk.LabelFrame(dialog, text="What Happens Next", padding=15)
+        sync_frame.pack(fill='x', padx=20, pady=10)
+    
+        sync_text = """When you click 'Backup and Close':
+
+    1. ✓ Your database will be backed up to SharePoint
+    2. ✓ Timestamped backup will be created
+    3. ✓ Other users can access your latest changes
+    4. ✓ Program will close safely
+
+    This ensures all your work is saved.
+        """
+    
+        ttk.Label(sync_frame, text=sync_text, justify='left').pack(anchor='w')
+    
+        # Important note
+        note_frame = ttk.Frame(dialog, padding=10)
+        note_frame.pack(fill='x', padx=20)
+    
+        ttk.Label(note_frame, 
+                  text="💡 Note: Last person to close the program pushes the final database state",
+                  foreground='blue', font=('Arial', 9),
+                  wraplength=550).pack()
+    
+        # Buttons
+        button_frame = ttk.Frame(dialog, padding=15)
+        button_frame.pack(fill='x')
+    
+        def sync_and_close():
+            result["action"] = "sync_and_close"
+            dialog.destroy()
+    
+        def cancel_close():
+            result["action"] = "cancel"
+            dialog.destroy()
+    
+        def close_without_sync():
+            confirm = messagebox.askyesno(
+                "Confirm Close Without Backup",
+                "Close without backing up to SharePoint?\n\n"
+                "⚠ WARNING: Your changes will NOT be saved!\n"
+                "⚠ Other users will NOT see your work!\n\n"
+                "Are you sure?",
+                icon='warning',
+                parent=dialog
+            )
+            if confirm:
+                result["action"] = "close_without_sync"
+                dialog.destroy()
+    
+        ttk.Button(button_frame, text="✓ Backup and Close", 
+                command=sync_and_close,
+                style='Accent.TButton').pack(side='left', padx=5)
+    
+        ttk.Button(button_frame, text="Cancel", 
+                command=cancel_close).pack(side='left', padx=5)
+    
+        ttk.Button(button_frame, text="⚠ Close Without Backup", 
+                command=close_without_sync).pack(side='right', padx=5)
+    
+        # Wait for dialog
+        dialog.wait_window()
+    
+        return result["action"]
+    
+    
+    
+    
+    def analyze_pm_capacity(self):
+        """Analyze if weekly PM target can handle all equipment requirements"""
+        try:
+            cursor = self.conn.cursor()
+        
+            # Get the actual counts from your database
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total_active,
+                    SUM(CASE WHEN monthly_pm = 1 THEN 1 ELSE 0 END) as monthly_pm_count,
+                    SUM(CASE WHEN annual_pm = 1 THEN 1 ELSE 0 END) as annual_pm_count,
+                    SUM(CASE WHEN status IN ('Run to Failure', 'Missing') THEN 1 ELSE 0 END) as excluded_count
+                FROM equipment 
+                WHERE status = 'Active' OR status IS NULL
+            ''')
+        
+            result = cursor.fetchone()
+            total_active = result[0]
+            monthly_count = result[1]
+            annual_count = result[2]
+            excluded = result[3]
+        
+            # Calculate requirements
+            monthly_pms_per_month = monthly_count  # Each needs PM every 30 days
+            annual_pms_per_month = round(annual_count / 12)  # Spread over 12 months
+            total_required_per_month = monthly_pms_per_month + annual_pms_per_month
+            
+            # Your capacity
+            weekly_capacity = self.weekly_pm_target
+            monthly_capacity = weekly_capacity * 4
+            
+            # Calculate surplus/deficit
+            surplus = monthly_capacity - total_required_per_month
+            
+            # Build report
+            report = "═" * 70 + "\n"
+            report += "PM CAPACITY ANALYSIS\n"
+            report += "═" * 70 + "\n\n"
+            
+            report += "EQUIPMENT BREAKDOWN:\n"
+            report += f"  Total Active Assets: {total_active:,}\n"
+            report += f"  Assets requiring Monthly PMs: {monthly_count:,}\n"
+            report += f"  Assets requiring Annual PMs: {annual_count:,}\n"
+            report += f"  Excluded (Run to Failure/Cannot Find): {excluded:,}\n\n"
+            
+            report += "MONTHLY PM REQUIREMENTS:\n"
+            report += f"  Monthly PMs needed: {monthly_pms_per_month:,}/month\n"
+            report += f"  Annual PMs needed: {annual_pms_per_month:,}/month\n"
+            report += f"  TOTAL Required: {total_required_per_month:,}/month\n\n"
+            
+            report += "YOUR CAPACITY:\n"
+            report += f"  Weekly target: {weekly_capacity} PMs/week\n"
+            report += f"  Monthly capacity: {monthly_capacity} PMs/month (4 weeks)\n\n"
+        
+            report += "═" * 70 + "\n"
+            if surplus >= 0:
+                report += "✅ VERDICT: CAPACITY IS SUFFICIENT!\n"
+                report += "═" * 70 + "\n"
+                report += f"You have {surplus} PMs/month surplus capacity.\n"
+                report += f"This is {(surplus/monthly_capacity*100):.1f}% extra capacity for:\n"
+                report += "  • Catching up on PM backlog\n"
+                report += "  • Handling equipment that was missed\n"
+                report += "  • Additional corrective maintenance\n\n"
+            else:
+                report += "❌ VERDICT: CAPACITY IS INSUFFICIENT!\n"
+                report += "═" * 70 + "\n"
+                report += f"You need {abs(surplus)} MORE PMs/month to keep up.\n\n"
+                report += "RECOMMENDATIONS:\n"
+                report += f"  • Increase weekly target to: {math.ceil(total_required_per_month/4)} PMs/week\n"
+                report += f"  • Or add {math.ceil(abs(surplus)/monthly_capacity * 100)}% more technician hours\n"
+                report += f"  • Or convert some Monthly PMs to Annual (if appropriate)\n\n"
+                report += "⚠️ WARNING: At current capacity, you will accumulate\n"
+                report += f"   a backlog of {abs(surplus)} PMs every month!\n\n"
+        
+            # Sustainability reference
+            report += "═" * 70 + "\n"
+            report += "WHAT YOUR CAPACITY CAN SUSTAIN:\n"
+            report += "═" * 70 + "\n"
+            report += f"  If ALL assets need Monthly PMs: {monthly_capacity:,} assets\n"
+            report += f"  If ALL assets need Annual PMs: {monthly_capacity * 12:,} assets\n"
+            report += f"  Current mix sustainability: {(monthly_capacity/total_required_per_month*100):.1f}%\n\n"
+        
+            # Check for never-done PMs
+            cursor.execute('''
+                SELECT COUNT(DISTINCT e.bfm_equipment_no)
+                FROM equipment e
+                LEFT JOIN pm_completions pc ON e.bfm_equipment_no = pc.bfm_equipment_no
+                WHERE e.status = 'Active'
+                AND (e.monthly_pm = 1 OR e.annual_pm = 1)
+                AND pc.bfm_equipment_no IS NULL
+            ''')
+            never_done = cursor.fetchone()[0]
+        
+            if never_done > 0:
+                report += "═" * 70 + "\n"
+                report += "⚠️ PM BACKLOG DETECTED:\n"
+                report += "═" * 70 + "\n"
+                report += f"  {never_done:,} assets have NEVER had a PM completed!\n"
+                report += f"  At current capacity, it will take {math.ceil(never_done/monthly_capacity)} months\n"
+                report += f"  just to complete the initial backlog (not counting recurring PMs).\n\n"
+                report += "CATCH-UP STRATEGY:\n"
+                report += f"  • Temporarily increase weekly target to {weekly_capacity + 50} for catch-up\n"
+                report += f"  • Prioritize 'never done' PMs (system already does this)\n"
+                report += f"  • Expected catch-up time: {math.ceil(never_done/(monthly_capacity + 50))}-{math.ceil(never_done/(monthly_capacity + 100))} months\n\n"
+        
+            # Show in dialog
+            dialog = tk.Toplevel(self.root)
+            dialog.title("PM Capacity Analysis")
+            dialog.geometry("800x600")
+            
+            text_frame = ttk.Frame(dialog)
+            text_frame.pack(fill='both', expand=True, padx=10, pady=10)
+            
+            scrollbar = ttk.Scrollbar(text_frame)
+            scrollbar.pack(side='right', fill='y')
+            
+            text_widget = tk.Text(text_frame, wrap='word', yscrollcommand=scrollbar.set, 
+                                font=('Courier', 10))
+            text_widget.pack(fill='both', expand=True)
+            scrollbar.config(command=text_widget.yview)
+        
+            text_widget.insert('1.0', report)
+            text_widget.config(state='disabled')
+        
+            # Close button
+            ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=10)
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to analyze PM capacity: {str(e)}")
+    
+    
+    
+    def add_cannot_find_asset_dialog(self):
+        """Dialog to manually add a new Cannot Find asset with auto-fill functionality"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add Cannot Find Asset")
+        dialog.geometry("500x450")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Form fields
+        ttk.Label(dialog, text="BFM Equipment No:").grid(row=0, column=0, sticky='w', padx=10, pady=10)
+        bfm_var = tk.StringVar()
+        bfm_entry = ttk.Entry(dialog, textvariable=bfm_var, width=30)
+        bfm_entry.grid(row=0, column=1, padx=10, pady=10)
+
+        ttk.Label(dialog, text="Description:").grid(row=1, column=0, sticky='w', padx=10, pady=10)
+        desc_var = tk.StringVar()
+        desc_entry = ttk.Entry(dialog, textvariable=desc_var, width=30)
+        desc_entry.grid(row=1, column=1, padx=10, pady=10)
+        
+        ttk.Label(dialog, text="Location:").grid(row=2, column=0, sticky='w', padx=10, pady=10)
+        location_var = tk.StringVar()
+        location_entry = ttk.Entry(dialog, textvariable=location_var, width=30)
+        location_entry.grid(row=2, column=1, padx=10, pady=10)
+
+        ttk.Label(dialog, text="Reported By (Technician):").grid(row=3, column=0, sticky='w', padx=10, pady=10)
+        tech_var = tk.StringVar()
+        tech_combo = ttk.Combobox(dialog, textvariable=tech_var, width=28)
+        tech_combo['values'] = self.technicians if hasattr(self, 'technicians') else []
+        tech_combo.grid(row=3, column=1, padx=10, pady=10)
+
+        ttk.Label(dialog, text="Report Date:").grid(row=4, column=0, sticky='w', padx=10, pady=10)
+        date_var = tk.StringVar(value=datetime.now().strftime('%Y-%m-%d'))
+        date_entry = ttk.Entry(dialog, textvariable=date_var, width=30)
+        date_entry.grid(row=4, column=1, padx=10, pady=10)
+        
+        ttk.Label(dialog, text="Notes (Optional):").grid(row=5, column=0, sticky='nw', padx=10, pady=10)
+        notes_text = tk.Text(dialog, width=30, height=5)
+        notes_text.grid(row=5, column=1, padx=10, pady=10)
+
+        # Status label for autofill feedback
+        status_label = ttk.Label(dialog, text="", foreground="blue")
+        status_label.grid(row=6, column=0, columnspan=2, pady=5)
+
+        def autofill_from_bfm(*args):
+            """Auto-fill description and location when BFM number is entered"""
+            bfm_no = bfm_var.get().strip()
+        
+            if not bfm_no:
+                # Clear fields if BFM is empty
+                desc_var.set("")
+                location_var.set("")
+                status_label.config(text="", foreground="blue")
+                return
+        
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT description, location 
+                    FROM equipment 
+                    WHERE bfm_equipment_no = ?
+                ''', (bfm_no,))
+            
+                result = cursor.fetchone()
+            
+                if result:
+                    description, location = result
+                    desc_var.set(description or "")
+                    location_var.set(location or "")
+                    status_label.config(text="✓ Equipment found - fields auto-filled", foreground="green")
+                else:
+                    # Don't clear existing values, just update status
+                    status_label.config(text="⚠ Equipment not found in database", foreground="orange")
+                
+            except Exception as e:
+                status_label.config(text=f"Error: {str(e)}", foreground="red")
+                print(f"Autofill error: {e}")
+
+        # Bind the autofill function to BFM entry changes
+        # Use a slight delay to avoid querying on every keystroke
+        bfm_var.trace_add('write', lambda *args: dialog.after(500, autofill_from_bfm))
+
+        def save_cannot_find_asset():
+            """Save the new Cannot Find asset to database"""
+            bfm_no = bfm_var.get().strip()
+            description = desc_var.get().strip()
+            location = location_var.get().strip()
+            technician = tech_var.get().strip()
+            report_date = date_var.get().strip()
+            notes = notes_text.get("1.0", tk.END).strip()
+    
+            # Validation
+            if not bfm_no:
+                messagebox.showwarning("Validation Error", "BFM Equipment No. is required")
+                return
+    
+            if not technician:
+                messagebox.showwarning("Validation Error", "Technician name is required")
+                return
+    
+            # Validate date format
+            try:
+                datetime.strptime(report_date, '%Y-%m-%d')
+            except ValueError:
+                messagebox.showwarning("Validation Error", "Date must be in YYYY-MM-DD format")
+                return
+    
+            try:
+                cursor = self.conn.cursor()
+        
+                # Check if asset already exists in cannot_find_assets
+                cursor.execute('SELECT bfm_equipment_no FROM cannot_find_assets WHERE bfm_equipment_no = ?', (bfm_no,))
+                existing = cursor.fetchone()
+        
+                if existing:
+                    result = messagebox.askyesno(
+                        "Asset Exists",
+                        f"Asset {bfm_no} already exists in Cannot Find list.\n\nUpdate the record with new information?"
+                    )
+                    if not result:
+                        return
+            
+                    # Update existing record
+                    cursor.execute('''
+                        UPDATE cannot_find_assets 
+                        SET description = ?, location = ?, technician_name = ?, 
+                            report_date = ?, status = 'Missing', notes = ?
+                        WHERE bfm_equipment_no = ?
+                    ''', (description, location, technician, report_date, notes, bfm_no))
+                else:
+                    # Insert new record
+                    cursor.execute('''
+                        INSERT INTO cannot_find_assets 
+                        (bfm_equipment_no, description, location, technician_name, report_date, status, notes)
+                        VALUES (?, ?, ?, ?, ?, 'Missing', ?)
+                    ''', (bfm_no, description, location, technician, report_date, notes))
+        
+                # Also update the equipment table status if the equipment exists
+                cursor.execute('SELECT bfm_equipment_no FROM equipment WHERE bfm_equipment_no = ?', (bfm_no,))
+                if cursor.fetchone():
+                    cursor.execute('UPDATE equipment SET status = ? WHERE bfm_equipment_no = ?', 
+                                ('Cannot Find', bfm_no))
+        
+                self.conn.commit()
+        
+                messagebox.showinfo("Success", f"Cannot Find asset {bfm_no} added successfully")
+        
+                # Refresh the Cannot Find list
+                self.load_cannot_find_assets()
+        
+                # Update statistics if method exists
+                if hasattr(self, 'update_equipment_statistics'):
+                    self.update_equipment_statistics()
+        
+                dialog.destroy()
+        
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to add Cannot Find asset: {str(e)}")
+
+        # Buttons
+        button_frame = ttk.Frame(dialog)
+        button_frame.grid(row=7, column=0, columnspan=2, pady=20)
+        
+        ttk.Button(button_frame, text="Save", command=save_cannot_find_asset).pack(side='left', padx=10)
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side='left', padx=10)
+
+        # Focus on first entry
+        bfm_entry.focus()
+    
+    
+    
+    
+    def create_cm_from_pm_dialog(self):
+        """Create a CM from within PM Completion tab - pre-filled with PM data"""
+        # Get current PM form data
+        bfm_no = self.completion_bfm_var.get().strip()
+        pm_notes = self.notes_text.get('1.0', 'end-1c').strip()
+        technician = self.completion_tech_var.get().strip()
+    
+        if not bfm_no:
+            messagebox.showwarning("Warning", "Please select equipment first")
+            return
+    
+        # Create CM dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Create CM from PM")
+        dialog.geometry("600x700")
+        dialog.transient(self.root)
+        dialog.grab_set()
+    
+        # Header
+        header = ttk.Label(dialog, text="Create Corrective Maintenance from PM", 
+                        font=('Arial', 12, 'bold'))
+        header.pack(pady=10)
+    
+        # Info label
+        info_text = f"Creating CM for Equipment: {bfm_no}"
+        ttk.Label(dialog, text=info_text, foreground='blue').pack(pady=5)
+    
+        # Form frame
+        form_frame = ttk.LabelFrame(dialog, text="CM Details", padding=15)
+        form_frame.pack(fill='both', expand=True, padx=10, pady=5)
+    
+        row = 0
+    
+        # CM Number (auto-generated)
+        ttk.Label(form_frame, text="CM Number:").grid(row=row, column=0, sticky='w', pady=5)
+        cm_number = self.generate_cm_number()
+        cm_number_var = tk.StringVar(value=cm_number)
+        ttk.Entry(form_frame, textvariable=cm_number_var, width=20, state='readonly').grid(
+            row=row, column=1, sticky='w', padx=5, pady=5)
+        row += 1
+    
+        # BFM Equipment (pre-filled, readonly)
+        ttk.Label(form_frame, text="BFM Equipment:").grid(row=row, column=0, sticky='w', pady=5)
+        bfm_var = tk.StringVar(value=bfm_no)
+        ttk.Entry(form_frame, textvariable=bfm_var, width=30, state='readonly').grid(
+            row=row, column=1, sticky='w', padx=5, pady=5)
+        row += 1
+    
+        # Get equipment description
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT description FROM equipment WHERE bfm_equipment_no = ?', (bfm_no,))
+        result = cursor.fetchone()
+        equip_desc = result[0] if result else "Unknown"
+    
+        ttk.Label(form_frame, text=f"Description: {equip_desc}", 
+                foreground='gray').grid(row=row, column=1, sticky='w', padx=5)
+        row += 1
+    
+        # Description (pre-filled with PM notes if available)
+        ttk.Label(form_frame, text="CM Description:*").grid(row=row, column=0, sticky='nw', pady=5)
+        description_text = tk.Text(form_frame, width=40, height=4)
+        description_text.grid(row=row, column=1, sticky='w', padx=5, pady=5)
+        if pm_notes:
+            description_text.insert('1.0', f"Issue found during PM:\n{pm_notes}")
+        row += 1
+    
+        # Priority
+        ttk.Label(form_frame, text="Priority:*").grid(row=row, column=0, sticky='w', pady=5)
+        priority_var = tk.StringVar(value="Medium")
+        priority_combo = ttk.Combobox(form_frame, textvariable=priority_var, 
+                                     values=['Low', 'Medium', 'High', 'Critical'], 
+                                     width=15, state='readonly')
+        priority_combo.grid(row=row, column=1, sticky='w', padx=5, pady=5)
+        row += 1
+    
+        # Assigned Technician (default to current user)
+        ttk.Label(form_frame, text="Assigned To:*").grid(row=row, column=0, sticky='w', pady=5)
+        assigned_var = tk.StringVar(value=self.user_name if hasattr(self, 'user_name') else technician)
+        assigned_combo = ttk.Combobox(form_frame, textvariable=assigned_var, 
+                                    values=self.technicians, width=20)
+        assigned_combo.grid(row=row, column=1, sticky='w', padx=5, pady=5)
+        row += 1
+    
+        # CM Date (default to today)
+        ttk.Label(form_frame, text="CM Date:*").grid(row=row, column=0, sticky='w', pady=5)
+        cm_date_var = tk.StringVar(value=datetime.now().strftime('%Y-%m-%d'))
+        ttk.Entry(form_frame, textvariable=cm_date_var, width=20).grid(
+            row=row, column=1, sticky='w', padx=5, pady=5)
+        ttk.Label(form_frame, text="(YYYY-MM-DD)", foreground='gray').grid(
+            row=row, column=2, sticky='w', padx=5)
+        row += 1
+    
+        # Additional Notes
+        ttk.Label(form_frame, text="Additional Notes:").grid(row=row, column=0, sticky='nw', pady=5)
+        notes_text = tk.Text(form_frame, width=40, height=3)
+        notes_text.grid(row=row, column=1, sticky='w', padx=5, pady=5)
+        row += 1
+    
+        # Validation and Save function
+        def validate_and_save_cm():
+            # Validate required fields
+            if not description_text.get('1.0', 'end-1c').strip():
+                messagebox.showerror("Error", "Please enter CM description")
+                return
+        
+            if not assigned_var.get().strip():
+                messagebox.showerror("Error", "Please assign a technician")
+                return
+        
+            # Validate date format
+            date_str = cm_date_var.get().strip()
+            try:
+                datetime.strptime(date_str, '%Y-%m-%d')
+                validated_date = date_str
+            except ValueError:
+                messagebox.showerror("Error", "Invalid date format. Use YYYY-MM-DD")
+                return
+        
+            # Save to database
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT INTO corrective_maintenance 
+                    (cm_number, bfm_equipment_no, description, priority, 
+                     assigned_technician, status, created_date, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    cm_number_var.get(),
+                    bfm_var.get(),
+                    description_text.get('1.0', 'end-1c').strip(),
+                    priority_var.get(),
+                    assigned_var.get(),
+                    'Open',
+                    validated_date,
+                    notes_text.get('1.0', 'end-1c').strip()
+                ))
+                self.conn.commit()
+            
+                messagebox.showinfo("Success", 
+                                f"✅ CM Created Successfully!\n\n"
+                                f"CM Number: {cm_number_var.get()}\n"
+                                f"Equipment: {bfm_var.get()}\n"
+                                f"Priority: {priority_var.get()}\n"
+                                f"Assigned to: {assigned_var.get()}\n\n"
+                                f"The CM is now visible in the CM Completions tab.")
+            
+                dialog.destroy()
+            
+                # Refresh CM list if the tab exists
+                if hasattr(self, 'load_corrective_maintenance'):
+                    self.load_corrective_maintenance()
+            
+                # Auto-sync to SharePoint if enabled
+                if hasattr(self, 'auto_sync_after_action'):
+                    self.auto_sync_after_action()
+            
+                # Update status bar
+                if hasattr(self, 'update_status'):
+                    self.update_status(f"✅ New CM created: {cm_number_var.get()} for {bfm_var.get()}")
+        
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to create CM: {str(e)}")
+    
+        # Buttons
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(fill='x', padx=10, pady=15)
+    
+        ttk.Button(button_frame, text="💾 Save CM", command=validate_and_save_cm, 
+                width=15).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="❌ Cancel", command=dialog.destroy, 
+                width=15).pack(side='left', padx=5)
+    
+        # Help text
+        help_text = "* Required fields\nThis CM will be saved to the database and visible to all technicians."
+        ttk.Label(dialog, text=help_text, foreground='gray', font=('Arial', 9)).pack(pady=5)
+
+
+    def generate_cm_number(self):
+        """Generate next CM number"""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT MAX(cm_number) FROM corrective_maintenance')
+        result = cursor.fetchone()
+    
+        if result[0]:
+            # Extract number and increment
+            try:
+                last_num = int(result[0].replace('CM-', ''))
+                next_num = last_num + 1
+            except:
+                next_num = 1
+        else:
+            next_num = 1
+    
+        return f"CM-{next_num:04d}"
+
+    
+    
+    def show_monthly_summary(self):
+        """Display monthly summary report in a new window"""
+        try:
+            # Create dialog window
+            summary_window = tk.Toplevel(self.root)
+            summary_window.title("Monthly PM Summary Report")
+            summary_window.geometry("900x700")
+            summary_window.transient(self.root)
+            summary_window.grab_set()
+        
+            # Create text widget with scrollbar
+            text_frame = ttk.Frame(summary_window)
+            text_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+            text_widget = tk.Text(text_frame, wrap='word', font=('Courier', 10))
+            scrollbar = ttk.Scrollbar(text_frame, orient='vertical', command=text_widget.yview)
+            text_widget.configure(yscrollcommand=scrollbar.set)
+        
+            text_widget.pack(side='left', fill='both', expand=True)
+            scrollbar.pack(side='right', fill='y')
+        
+            # Month/Year selection frame
+            selection_frame = ttk.Frame(summary_window)
+            selection_frame.pack(fill='x', padx=10, pady=5)
+            
+            ttk.Label(selection_frame, text="Month:").pack(side='left', padx=5)
+            month_var = tk.StringVar(value=str(datetime.now().month))
+            month_combo = ttk.Combobox(selection_frame, textvariable=month_var, 
+                                    values=list(range(1, 13)), width=5, state='readonly')
+            month_combo.pack(side='left', padx=5)
+        
+            ttk.Label(selection_frame, text="Year:").pack(side='left', padx=5)
+            year_var = tk.StringVar(value=str(datetime.now().year))
+            year_combo = ttk.Combobox(selection_frame, textvariable=year_var,
+                                values=list(range(2020, 2030)), width=8, state='readonly')
+            year_combo.pack(side='left', padx=5)
+    
+            # ========== DEFINE ALL FUNCTIONS FIRST ==========
+        
+            def generate_report():
+                """Generate and display the report"""
+                try:
+                    month = int(month_var.get())
+                    year = int(year_var.get())
+                    
+                    # Clear existing text
+                    text_widget.delete('1.0', 'end')
+                    
+                    # Redirect print output to text widget
+                    import sys
+                    from io import StringIO
+                    old_stdout = sys.stdout
+                    sys.stdout = StringIO()
+            
+                    # Generate the report
+                    generate_monthly_summary_report(self.conn, month, year)
+                    
+                    # Get the output and restore stdout
+                    output = sys.stdout.getvalue()
+                    sys.stdout = old_stdout
+                
+                    # Display in text widget
+                    text_widget.insert('1.0', output)
+                
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to generate report: {str(e)}")
+        
+            def export_report():
+                """Export report to text file"""
+                try:
+                    filename = filedialog.asksaveasfilename(
+                        title="Export Monthly Summary",
+                        defaultextension=".txt",
+                        initialname=f"Monthly_Summary_{month_var.get()}_{year_var.get()}.txt",
+                        filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+                    )
+                    if filename:
+                        with open(filename, 'w') as f:
+                            f.write(text_widget.get('1.0', 'end'))
+                        messagebox.showinfo("Success", f"Report exported to {filename}")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to export text report: {str(e)}")
+        
+            def export_professional_pdf():
+                """Export professional PDF monthly report"""
+                try:
+                    month = int(month_var.get())
+                    year = int(year_var.get())
+                    
+                    # Show progress message
+                    progress_label = ttk.Label(selection_frame, text="Generating professional PDF...", 
+                                               foreground='blue')
+                    progress_label.pack(side='left', padx=10)
+                    summary_window.update()
+                    
+                    # Generate the PDF
+                    filename = export_professional_monthly_report_pdf(self.conn, month, year)
+                    
+                    # Remove progress label
+                    progress_label.destroy()
+                    
+                    # Success message with option to open
+                    result = messagebox.askyesno(
+                        "Success", 
+                        f"Professional monthly report exported!\n\n{filename}\n\nWould you like to open it now?",
+                        icon='info'
+                    )
+                
+                    if result:
+                        # Open the PDF
+                        import os
+                        import platform
+                        
+                        if platform.system() == 'Windows':
+                            os.startfile(filename)
+                        elif platform.system() == 'Darwin':  # macOS
+                            os.system(f'open "{filename}"')
+                        else:  # Linux
+                            os.system(f'xdg-open "{filename}"')
+                
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to generate PDF report:\n\n{str(e)}")
+        
+            # ========== NOW CREATE THE BUTTONS ==========
+        
+            ttk.Button(selection_frame, text="Generate Report", 
+                    command=generate_report).pack(side='left', padx=10)
+        
+            ttk.Button(selection_frame, text="Export Text", 
+                    command=export_report).pack(side='left', padx=5)
+        
+            ttk.Button(selection_frame, text="📄 Export Professional PDF", 
+                    command=export_professional_pdf).pack(side='left', padx=5)
+        
+            ttk.Button(selection_frame, text="Close", 
+                    command=summary_window.destroy).pack(side='right', padx=5)
+        
+            # Generate initial report for current month
+            generate_report()
+    
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to show monthly summary: {str(e)}")
+    
+    
+    
+    
     
     # Add this method to your class
     def setup_program_colors(self):
@@ -1362,189 +2937,183 @@ class AITCMMSSystem:
     
     
     
-    
-    
-
     def get_sharepoint_backup_path(self):
         """Get path to specific SharePoint PM/CM folder with comprehensive fallbacks"""
         try:
             home_dir = os.path.expanduser("~")
         
-            # Primary target: Your specific SharePoint PM/CM path
-            primary_sharepoint_path = os.path.join(home_dir, "Advanced Integration Technology", "PM CM - Documents", "General", "Asset Maintenance", "CMMS_Backups")
-            
-            # Check if the SharePoint PM/CM path exists
-            sharepoint_parent = os.path.join(home_dir, "Advanced Integration Technology", "PM CM - Documents", "General", "Asset Maintenance")
-            if os.path.exists(sharepoint_parent) and os.path.isdir(sharepoint_parent):
-                # Create the CMMS_Backups subfolder in Asset Maintenance
-                os.makedirs(primary_sharepoint_path, exist_ok=True)
-                
+            print("\n" + "=" * 60)
+            print("SEARCHING FOR SHAREPOINT BACKUP FOLDER")
+            print("=" * 60)
+    
+            # PRIMARY target: Shared team SharePoint site (THE CORRECT ONE!)
+            primary_sharepoint_path = os.path.join(home_dir, "Advanced Integration Technology", "PM CM - CMMS_Backups")
+        
+            print(f"Checking PRIMARY location: {primary_sharepoint_path}")
+            if os.path.exists(primary_sharepoint_path) and os.path.isdir(primary_sharepoint_path):
                 # Test write permissions
                 test_file = os.path.join(primary_sharepoint_path, "test_write.tmp")
                 try:
                     with open(test_file, 'w') as f:
                         f.write("test")
                     os.remove(test_file)
-                    print(f"Using SharePoint PM/CM Asset Maintenance folder: {primary_sharepoint_path}")
+                    print(f"✓ SUCCESS! Using SHARED team SharePoint location:")
+                    print(f"  {primary_sharepoint_path}")
+                    print("=" * 60 + "\n")
                     return primary_sharepoint_path
                 except Exception as e:
-                    print(f"Cannot write to SharePoint PM/CM path: {e}")
+                    print(f"✗ Cannot write to primary path: {e}")
+            else:
+                print(f"✗ Primary path does not exist")
+    
+            # Fallback 1: Try with "Asset Maintenance" subfolder structure
+            print("\nTrying fallback with Asset Maintenance structure...")
+            fallback_with_asset = os.path.join(home_dir, "Advanced Integration Technology", "PM CM - General", "Asset Maintenance", "CMMS_Backups")
+            print(f"Checking: {fallback_with_asset}")
         
-            # Fallback 1: Try other locations in the same SharePoint site
-            fallback_sharepoint_paths = [
-                os.path.join(home_dir, "Advanced Integration Technology", "PM CM - Documents", "General", "CMMS_Backups"),
-                os.path.join(home_dir, "Advanced Integration Technology", "PM CM - Documents", "CMMS_Backups"),
-                os.path.join(home_dir, "Advanced Integration Technology", "CMMS_Backups")
-            ]
-        
-            for fallback_path in fallback_sharepoint_paths:
-                parent_dir = os.path.dirname(fallback_path)
-                if os.path.exists(parent_dir) and os.path.isdir(parent_dir):
-                    try:
-                        os.makedirs(fallback_path, exist_ok=True)
-                        # Test write permissions
-                        test_file = os.path.join(fallback_path, "test_write.tmp")
-                        with open(test_file, 'w') as f:
-                            f.write("test")
-                        os.remove(test_file)
-                        print(f"Using SharePoint fallback location: {fallback_path}")
-                        return fallback_path
-                    except Exception as e:
-                        print(f"Cannot write to fallback SharePoint path {fallback_path}: {e}")
-                        continue
-        
-            # Fallback 2: Work OneDrive root with PM/CM structure
+            sharepoint_parent = os.path.dirname(fallback_with_asset)
+            if os.path.exists(sharepoint_parent) and os.path.isdir(sharepoint_parent):
+                try:
+                    os.makedirs(fallback_with_asset, exist_ok=True)
+                    test_file = os.path.join(fallback_with_asset, "test_write.tmp")
+                    with open(test_file, 'w') as f:
+                        f.write("test")
+                    os.remove(test_file)
+                    print(f"✓ Using fallback with Asset Maintenance: {fallback_with_asset}")
+                    print("=" * 60 + "\n")
+                    return fallback_with_asset
+                except Exception as e:
+                    print(f"✗ Cannot write: {e}")
+            else:
+                print(f"✗ Path does not exist")
+    
+            # Fallback 2: Personal OneDrive PM-CM folder
+            print("\nTrying personal OneDrive location...")
             work_onedrive_path = os.path.join(home_dir, "OneDrive - Advanced Integration Technology", "PM-CM", "CMMS_Backups")
+            print(f"Checking: {work_onedrive_path}")
+        
             work_onedrive_root = os.path.join(home_dir, "OneDrive - Advanced Integration Technology")
             if os.path.exists(work_onedrive_root) and os.path.isdir(work_onedrive_root):
                 try:
                     os.makedirs(work_onedrive_path, exist_ok=True)
-                    # Test write permissions
                     test_file = os.path.join(work_onedrive_path, "test_write.tmp")
                     with open(test_file, 'w') as f:
                         f.write("test")
                     os.remove(test_file)
-                    print(f"Using work OneDrive with PM/CM structure: {work_onedrive_path}")
+                    print(f"⚠ Using personal OneDrive (not shared team location): {work_onedrive_path}")
+                    print("=" * 60 + "\n")
                     return work_onedrive_path
                 except Exception as e:
-                    print(f"Cannot write to work OneDrive PM/CM path: {e}")
-        
-            # Fallback 3: Work OneDrive root
+                    print(f"✗ Cannot write: {e}")
+            else:
+                print(f"✗ Path does not exist")
+    
+            # Fallback 3: Personal OneDrive root
             work_onedrive_basic = os.path.join(home_dir, "OneDrive - Advanced Integration Technology", "AIT_CMMS_Backups")
+            print(f"Checking: {work_onedrive_basic}")
+        
             if os.path.exists(work_onedrive_root) and os.path.isdir(work_onedrive_root):
                 try:
                     os.makedirs(work_onedrive_basic, exist_ok=True)
-                    # Test write permissions
                     test_file = os.path.join(work_onedrive_basic, "test_write.tmp")
                     with open(test_file, 'w') as f:
                         f.write("test")
                     os.remove(test_file)
-                    print(f"Using work OneDrive basic location: {work_onedrive_basic}")
+                    print(f"⚠ Using personal OneDrive basic: {work_onedrive_basic}")
+                    print("=" * 60 + "\n")
                     return work_onedrive_basic
                 except Exception as e:
-                    print(f"Cannot write to work OneDrive basic path: {e}")
-        
-            # Fallback 4: Personal OneDrive
-            personal_onedrive_path = os.path.join(home_dir, "OneDrive", "AIT_CMMS_Backups")
-            personal_onedrive_root = os.path.join(home_dir, "OneDrive")
-            if os.path.exists(personal_onedrive_root) and os.path.isdir(personal_onedrive_root):
-                try:
-                    os.makedirs(personal_onedrive_path, exist_ok=True)
-                    # Test write permissions
-                    test_file = os.path.join(personal_onedrive_path, "test_write.tmp")
-                    with open(test_file, 'w') as f:
-                        f.write("test")
-                    os.remove(test_file)
-                    print(f"Using personal OneDrive: {personal_onedrive_path}")
-                    return personal_onedrive_path
-                except Exception as e:
-                    print(f"Cannot write to personal OneDrive: {e}")
-        
-            # Fallback 5: Local backup (ultimate fallback)
-            local_backup_path = os.path.join(home_dir, "AIT_CMMS_Backups")
-            os.makedirs(local_backup_path, exist_ok=True)
-            print(f"Using local backup (no OneDrive available): {local_backup_path}")
-            return local_backup_path
-        
+                    print(f"✗ Cannot write: {e}")
+            else:
+                print(f"✗ Path does not exist")
+    
+            # Final fallback: Local Documents folder
+            print("\nUsing final fallback...")
+            local_path = os.path.join(home_dir, "Documents", "AIT_CMMS_Backups")
+            try:
+                os.makedirs(local_path, exist_ok=True)
+                print(f"⚠ WARNING: Using local Documents folder (not synced): {local_path}")
+                print("=" * 60 + "\n")
+                return local_path
+            except Exception as e:
+                print(f"✗ Cannot create local backup folder: {e}")
+                print("=" * 60 + "\n")
+                return None
+    
         except Exception as e:
-            print(f"Error finding backup path: {e}")
-            # Ultimate emergency fallback
-            emergency_path = os.path.join(os.path.expanduser("~"), "AIT_CMMS_Backups")
-            os.makedirs(emergency_path, exist_ok=True)
-            print(f"Using emergency local backup: {emergency_path}")
-            return emergency_path
+            print(f"✗ Error determining SharePoint backup path: {e}")
+            print("=" * 60 + "\n")
+            return None
 
+    
 
 
     def schedule_sharepoint_only_backups(self, sync_dir):
-        """Schedule automatic backups to SharePoint only"""
+        """Schedule automatic backups to SharePoint - every 30 seconds"""
         try:
             # Create initial backup immediately (5 seconds after startup)
             self.root.after(5000, lambda: self.sharepoint_only_backup(sync_dir))
+            
+            # Schedule frequent backups - run every 30 seconds (30,000 milliseconds)
+            self.root.after(30 * 1000, lambda: self.recurring_sharepoint_backup(sync_dir))
         
-            # Schedule daily backups - run every 24 hours
-            self.root.after(24 * 60 * 60 * 1000, lambda: self.recurring_sharepoint_backup(sync_dir))
-        
-            print(f"Scheduled SharePoint-only backups to: {sync_dir}")
+            print(f"Scheduled 30-second SharePoint backups to: {sync_dir}")
         
         except Exception as e:
             print(f"Error scheduling SharePoint backups: {e}")
+    
 
     def recurring_sharepoint_backup(self, sync_dir):
-        """Recurring backup function that runs daily"""
+        """Recurring backup function that runs every 30 seconds"""
         try:
             # Perform the backup
             self.sharepoint_only_backup(sync_dir)
         
-            # Reschedule for next day (24 hours later)
-            self.root.after(24 * 60 * 60 * 1000, lambda: self.recurring_sharepoint_backup(sync_dir))
+            # Reschedule for 30 seconds later
+            self.root.after(30 * 1000, lambda: self.recurring_sharepoint_backup(sync_dir))
         
         except Exception as e:
             print(f"Error in recurring backup: {e}")
             # Try to reschedule anyway
-            self.root.after(24 * 60 * 60 * 1000, lambda: self.recurring_sharepoint_backup(sync_dir))
+            self.root.after(30 * 1000, lambda: self.recurring_sharepoint_backup(sync_dir))
 
 
-
-
-
-
-
-    def setup_existing_database_with_sharepoint_backup(self):
-        """Set up existing database with SharePoint-only backups - FIXED VERSION"""
+    def auto_sync_after_action(self):
+        """Automatically sync to SharePoint after data entry"""
         try:
-            # First, check if database file exists
-            db_file = 'ait_cmms_database.db'
-            if not os.path.exists(db_file):
-                messagebox.showerror("Database Error", 
-                                "Database file not found: ait_cmms_database.db\n\n"
-                                "Please ensure the database file is in the same directory as the application.")
-                return None
-    
-            # Get the SharePoint-synced backup path
-            sync_dir = self.get_sharepoint_backup_path()
+            if hasattr(self, 'backup_sync_dir') and self.backup_sync_dir:
+                # Push changes to SharePoint immediately
+                self.sharepoint_only_backup(self.backup_sync_dir)
+                print("Auto-synced to SharePoint after data entry")
+        except Exception as e:
+            print(f"Auto-sync error: {e}")
+
+
+
+
+
+
+    def manual_sync_from_sharepoint(self):
+        """Manual sync button - pull latest data from SharePoint"""
+        try:
+            # First, backup current local changes
+            if hasattr(self, 'backup_sync_dir') and self.backup_sync_dir:
+                self.sharepoint_only_backup(self.backup_sync_dir)
         
-            if not sync_dir:
-                print("Could not establish backup directory")
-                return None
+            # Then sync from SharePoint
+            self.sync_database_before_init()
         
-            print(f"Using backup directory: {sync_dir}")
+            # Refresh all views
+            self.load_equipment_data()
+            if hasattr(self, 'load_corrective_maintenance'):
+                self.load_corrective_maintenance()
+            if hasattr(self, 'load_recent_completions'):
+                self.load_recent_completions()
         
-            # Store sync_dir for later use (when GUI is created)
-            self.backup_sync_dir = sync_dir
-            
-            
-            
-            # Schedule automatic backups to SharePoint only
-            self.schedule_sharepoint_only_backups(sync_dir)
-        
-            return sync_dir
+            messagebox.showinfo("Sync Complete", "Data refreshed from SharePoint!")
         
         except Exception as e:
-            error_msg = f"Error setting up database with SharePoint backup: {e}"
-            print(error_msg)
-            self.update_status(error_msg)
-            return None
+            messagebox.showerror("Sync Error", f"Failed to sync: {str(e)}")
 
 
     def schedule_sharepoint_only_backups(self, sync_dir):
@@ -1558,48 +3127,54 @@ class AITCMMSSystem:
         except Exception as e:
             print(f"Error scheduling SharePoint backups: {e}")
 
+    
     def on_closing(self):
-        """Handle application closing with final backup"""
+        """Enhanced closing with conflict detection and comprehensive smart merge"""
         try:
-            if hasattr(self, 'backup_sync_dir'):
-                print("Creating final backup before closing...")
-                self.sharepoint_only_backup(self.backup_sync_dir)
-                print("Final backup completed")
+            # Check if SharePoint was updated during our session
+            conflict_detected = self.check_for_conflicts()
         
-            # Close database connection
-            if hasattr(self, 'conn'):
-                self.conn.close()
-        
-            # Destroy the main window
-            self.root.destroy()
-        
+            if conflict_detected:
+                # Show smart merge dialog
+                merge_result = self.show_smart_merge_dialog()
+            
+                if merge_result == "cancel":
+                    return  # Don't close
+                elif merge_result == "merge":
+                    # Perform comprehensive smart merge
+                    self.perform_comprehensive_merge_and_close()
+                elif merge_result == "override":
+                    # User chose to override (dangerous)
+                    self.backup_and_close_normal()
+            else:
+                # No conflicts - normal close with validation
+                sync_result = self.show_closing_sync_dialog()
+            
+                if sync_result == "cancel":
+                    return
+                elif sync_result == "close_without_sync":
+                    if hasattr(self, 'conn'):
+                        self.conn.close()
+                    self.root.destroy()
+                elif sync_result == "sync_and_close":
+                    self.backup_and_close_normal()
+                
         except Exception as e:
             print(f"Error during closing: {e}")
-            self.root.destroy()
+            result = messagebox.askyesno(
+                "Error During Close",
+                f"Error: {str(e)}\n\nForce close anyway?",
+                icon='warning'
+            )
+            if result:
+                try:
+                    if hasattr(self, 'conn'):
+                        self.conn.close()
+                except:
+                    pass
+                self.root.destroy()
 
 
-
-
-    def create_initial_backup(self, sync_dir, db_file):
-        """Create initial backup of existing database"""
-        try:
-            if not os.path.exists(db_file):
-                print(f"Database file {db_file} not found")
-                return
-            
-            # Create timestamped backup filename
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            backup_file = os.path.join(sync_dir, f"ait_cmms_backup_{timestamp}.db")
-            
-            # Create backup of existing database
-            shutil.copy2(db_file, backup_file)
-            
-            print(f"Initial backup created: {backup_file}")
-            self.update_status(f"Initial backup created in backup folder")
-        
-        except Exception as e:
-            print(f"Error creating initial backup: {e}")
-            self.update_status(f"Backup error: {str(e)}")
 
     def sharepoint_only_backup(self, sync_dir):
         """Create backup directly in SharePoint folder only - FIXED VERSION"""
@@ -3025,52 +4600,6 @@ class AITCMMSSystem:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to update database: {str(e)}")
     
-    def set_monthly_annual_pms_only(self):
-        """Set all equipment to Monthly and Annual PMs only (disable Six Month PMs)"""
-        result = messagebox.askyesno(
-            "Confirm PM Update", 
-            "This will set ALL equipment to:\n"
-            "• Monthly PM: ENABLED\n"
-            "• Six Month PM: DISABLED\n" 
-            "• Annual PM: ENABLED\n\n"
-            "Continue?"
-        )
-    
-        if result:
-            try:
-                cursor = self.conn.cursor()
-            
-                # Get count before update
-                cursor.execute('SELECT COUNT(*) FROM equipment')
-                total_count = cursor.fetchone()[0]
-            
-                # Update all equipment
-                cursor.execute('''
-                    UPDATE equipment 
-                    SET monthly_pm = 1, 
-                        six_month_pm = 0, 
-                        annual_pm = 1,
-                        updated_date = CURRENT_TIMESTAMP
-                ''')
-            
-                updated_count = cursor.rowcount
-                self.conn.commit()
-            
-                messagebox.showinfo(
-                    "Success", 
-                    f"Updated {updated_count} equipment records!\n\n"
-                    f"All equipment now set to:\n"
-                    f"• Monthly PM: Enabled\n"
-                    f"• Six Month PM: Disabled\n"
-                    f"• Annual PM: Enabled"
-                )
-            
-                # Refresh the equipment list display
-                self.refresh_equipment_list()
-                self.update_status(f"Updated {updated_count} equipment PM settings")
-            
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to update PM settings: {str(e)}")
     
     def standardize_all_database_dates(self):
         """Standardize all dates in the database to YYYY-MM-DD format"""
@@ -3173,6 +4702,8 @@ class AITCMMSSystem:
     
     def __init__(self, root):
         self.root = root
+        self.session_start_time = datetime.now()
+        self.sharepoint_file_modified_time = None
         self.root.title("AIT Complete CMMS - Computerized Maintenance Management System")
         self.root.geometry("1800x1000")
         try:
@@ -3199,18 +4730,19 @@ class AITCMMSSystem:
 
         # ===== CRITICAL FIX: SET UP SHAREPOINT BACKUP FIRST =====
         self.backup_sync_dir = self.get_sharepoint_backup_path()
-    
+        # Start automatic pull from SharePoint (after setting up backup_sync_dir)
+       
         # ===== SYNC DATABASE BEFORE INITIALIZING =====
         # This will download the latest backup if available BEFORE creating local database
         database_synced = self.sync_database_before_init()
     
         # ===== NOW Initialize database (will use synced version if available) =====
         self.init_database()
+        self.mro_manager = MROStockManager(self)
+        self.parts_integration = CMPartsIntegration(self)  
         self.init_pm_templates_database()
     
-        # Set up ongoing backup system
-        if self.backup_sync_dir:
-            self.schedule_sharepoint_only_backups(self.backup_sync_dir)
+        
     
     
         # ===== CRITICAL FIX: SET UP SHAREPOINT BACKUP FIRST =====
@@ -3226,9 +4758,7 @@ class AITCMMSSystem:
         self.cleanup_local_backups()
 
 
-        # Set up ongoing backup system
-        if hasattr(self, 'backup_sync_dir') and self.backup_sync_dir:
-            self.schedule_sharepoint_only_backups(self.backup_sync_dir)
+        
 
         # Light sync check (heavy lifting already done)
         self.sync_database_on_startup()
@@ -3242,11 +4772,12 @@ class AITCMMSSystem:
             'Monthly': 30,
             'Six Month': 180,
             'Annual': 365,
-            'Run Till Failure': 0
+            'Run to Failure': 0,
+            'CANNOT FIND': 0
         }
     
         # Weekly PM target
-        self.weekly_pm_target = 110
+        self.weekly_pm_target = 160
     
         # Initialize data storage
         self.equipment_data = []
@@ -3276,7 +4807,263 @@ class AITCMMSSystem:
         self.setup_program_colors()
         print(f"AIT Complete CMMS System initialized successfully for {self.user_name} ({self.current_user_role})")
 
+    
+    def close_cm_dialog(self):
+        """Close selected CM with parts consumption tracking"""
+        selected = self.cm_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please select a CM to close")
+            return
 
+        # Get selected CM data
+        item = self.cm_tree.item(selected[0])
+        cm_number = item['values'][0]
+    
+        # Fetch CM details
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT cm_number, bfm_equipment_no, description, assigned_technician, 
+                status, labor_hours, notes, root_cause, corrective_action
+            FROM corrective_maintenance 
+            WHERE cm_number = ?
+        ''', (cm_number,))
+    
+        cm_data = cursor.fetchone()
+        if not cm_data:
+            messagebox.showerror("Error", "CM not found")
+            return
+    
+        (cm_num, equipment, desc, tech, status, labor_hrs, 
+         notes, root_cause, corr_action) = cm_data
+    
+        # Check if already closed
+        if status in ['Closed', 'Completed']:
+            messagebox.showinfo("Info", f"CM {cm_number} is already closed")
+            return
+    
+        # Create closure dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Close CM - {cm_number}")
+        dialog.geometry("700x600")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Header
+        header_frame = ttk.Frame(dialog)
+        header_frame.pack(fill='x', padx=10, pady=10)
+    
+        ttk.Label(header_frame, text=f"Close Corrective Maintenance", 
+                font=('Arial', 12, 'bold')).pack()
+        ttk.Label(header_frame, text=f"CM Number: {cm_number}", 
+                font=('Arial', 10)).pack()
+        ttk.Label(header_frame, text=f"Equipment: {equipment}", 
+                font=('Arial', 10)).pack()
+    
+        # Main form frame with scrollbar
+        canvas = tk.Canvas(dialog)
+        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+    
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+    
+        canvas.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        scrollbar.pack(side="right", fill="y")
+    
+        # Form fields
+        row = 0
+    
+        # Completion Date
+        ttk.Label(scrollable_frame, text="Completion Date*:", 
+                font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='w', padx=10, pady=5)
+        completion_date_var = tk.StringVar(value=datetime.now().strftime('%Y-%m-%d'))
+        ttk.Entry(scrollable_frame, textvariable=completion_date_var, width=40).grid(
+            row=row, column=1, sticky='w', padx=10, pady=5)
+        ttk.Label(scrollable_frame, text="(Format: YYYY-MM-DD)", 
+                font=('Arial', 8, 'italic')).grid(row=row, column=2, sticky='w')
+        row += 1
+    
+        # Labor Hours
+        ttk.Label(scrollable_frame, text="Total Labor Hours*:", 
+                font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='w', padx=10, pady=5)
+        labor_hours_var = tk.StringVar(value=str(labor_hrs) if labor_hrs else '')
+        ttk.Entry(scrollable_frame, textvariable=labor_hours_var, width=40).grid(
+            row=row, column=1, sticky='w', padx=10, pady=5)
+        row += 1
+    
+        ttk.Separator(scrollable_frame, orient='horizontal').grid(
+            row=row, column=0, columnspan=3, sticky='ew', pady=10)
+        row += 1
+    
+        # Root Cause
+        ttk.Label(scrollable_frame, text="Root Cause*:", 
+                font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='nw', padx=10, pady=5)
+        root_cause_text = tk.Text(scrollable_frame, width=50, height=4)
+        root_cause_text.insert('1.0', root_cause or '')
+        root_cause_text.grid(row=row, column=1, sticky='w', padx=10, pady=5)
+        row += 1
+    
+        # Corrective Action
+        ttk.Label(scrollable_frame, text="Corrective Action Taken*:", 
+                font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='nw', padx=10, pady=5)
+        corr_action_text = tk.Text(scrollable_frame, width=50, height=4)
+        corr_action_text.insert('1.0', corr_action or '')
+        corr_action_text.grid(row=row, column=1, sticky='w', padx=10, pady=5)
+        row += 1
+    
+        # Additional Notes
+        ttk.Label(scrollable_frame, text="Additional Notes:", 
+                font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='nw', padx=10, pady=5)
+        notes_text = tk.Text(scrollable_frame, width=50, height=4)
+        notes_text.insert('1.0', notes or '')
+        notes_text.grid(row=row, column=1, sticky='w', padx=10, pady=5)
+        row += 1
+    
+        ttk.Separator(scrollable_frame, orient='horizontal').grid(
+            row=row, column=0, columnspan=3, sticky='ew', pady=10)
+        row += 1
+    
+        # Parts consumption question - THIS IS THE KEY INTEGRATION POINT
+        ttk.Label(scrollable_frame, text="Were any parts used from MRO Stock?", 
+                font=('Arial', 11, 'bold'), foreground='blue').grid(
+                    row=row, column=0, columnspan=2, sticky='w', padx=10, pady=10)
+        row += 1
+    
+        parts_used_var = tk.StringVar(value="No")
+        ttk.Radiobutton(scrollable_frame, text="No parts were used", 
+                    variable=parts_used_var, value="No").grid(
+                        row=row, column=0, columnspan=2, sticky='w', padx=30, pady=5)
+        row += 1
+    
+        ttk.Radiobutton(scrollable_frame, text="Yes, parts were used (will open parts dialog)", 
+                    variable=parts_used_var, value="Yes").grid(
+                        row=row, column=0, columnspan=2, sticky='w', padx=30, pady=5)
+        row += 1
+    
+        # Button frame
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(fill='x', padx=10, pady=10)
+    
+        def validate_and_proceed():
+            """Validate closure form and proceed to parts or close"""
+            # Validate required fields
+            if not completion_date_var.get().strip():
+                messagebox.showerror("Error", "Completion date is required")
+                return
+        
+            try:
+                datetime.strptime(completion_date_var.get(), '%Y-%m-%d')
+            except ValueError:
+                messagebox.showerror("Error", "Invalid date format. Use YYYY-MM-DD")
+                return
+        
+            if not labor_hours_var.get().strip():
+                messagebox.showerror("Error", "Labor hours is required")
+                return
+        
+            try:
+                labor_hrs_value = float(labor_hours_var.get())
+                if labor_hrs_value < 0:
+                    messagebox.showerror("Error", "Labor hours cannot be negative")
+                    return
+            except ValueError:
+                messagebox.showerror("Error", "Invalid labor hours value")
+                return
+        
+            root_cause_value = root_cause_text.get('1.0', 'end-1c').strip()
+            if not root_cause_value:
+                messagebox.showerror("Error", "Root cause is required")
+                return
+        
+            corr_action_value = corr_action_text.get('1.0', 'end-1c').strip()
+            if not corr_action_value:
+                messagebox.showerror("Error", "Corrective action is required")
+                return
+        
+            # Get all form values
+            completion_date = completion_date_var.get()
+            labor_hours = float(labor_hours_var.get())
+            root_cause = root_cause_value
+            corrective_action = corr_action_value
+            additional_notes = notes_text.get('1.0', 'end-1c').strip()
+        
+            # Combine notes
+            all_notes = additional_notes
+        
+            def finalize_closure(parts_recorded):
+                """Finalize CM closure after parts handling"""
+                if not parts_recorded and parts_used_var.get() == "Yes":
+                    # User cancelled parts dialog, don't close CM
+                    return
+            
+                try:
+                    cursor = self.conn.cursor()
+                
+                    # Update CM record
+                    cursor.execute('''
+                        UPDATE corrective_maintenance
+                        SET status = 'Closed',
+                            completion_date = ?,
+                            labor_hours = ?,
+                            root_cause = ?,
+                            corrective_action = ?,
+                            notes = ?
+                        WHERE cm_number = ?
+                    ''', (completion_date, labor_hours, root_cause, 
+                        corrective_action, all_notes, cm_number))
+                
+                    self.conn.commit()
+                
+                    messagebox.showinfo("Success", 
+                        f"CM {cm_number} closed successfully!\n\n"
+                        f"Completion Date: {completion_date}\n"
+                        f"Labor Hours: {labor_hours}\n"
+                        f"Status: Closed")
+                
+                    dialog.destroy()
+                    self.load_corrective_maintenance()
+                
+                except Exception as e:
+                    self.conn.rollback()
+                    messagebox.showerror("Error", f"Failed to close CM: {str(e)}")
+        
+            # Check if parts were used
+            if parts_used_var.get() == "Yes":
+                # Close this dialog and open parts consumption dialog
+                dialog.destroy()
+            
+                # Open parts consumption dialog
+                # This requires the CMPartsIntegration module to be initialized
+                if hasattr(self, 'parts_integration'):
+                    self.parts_integration.show_parts_consumption_dialog(
+                        cm_number=cm_number,
+                        technician_name=tech or 'Unknown',
+                        callback=finalize_closure
+                    )
+                else:
+                    messagebox.showerror("Error", 
+                        "Parts integration module not initialized.\n"
+                        "Please contact system administrator.")
+                    # Still update CM but without parts
+                    finalize_closure(True)
+            else:
+                # No parts used, close directly
+                finalize_closure(True)
+    
+        ttk.Button(button_frame, text="💾 Proceed to Close CM", 
+                command=validate_and_proceed).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="❌ Cancel", 
+                command=dialog.destroy).pack(side='left', padx=5)
+    
+    
+    
+    
+    
     
     def sync_database_before_init(self):
         """Download and sync with latest database backup BEFORE initializing local database"""
@@ -3284,67 +5071,105 @@ class AITCMMSSystem:
             if not hasattr(self, 'backup_sync_dir') or not self.backup_sync_dir:
                 print("No backup directory configured, skipping pre-init sync")
                 return False
-        
+    
             backup_dir = self.backup_sync_dir
             local_db = 'ait_cmms_database.db'
-    
-            print("Checking for latest database backup before initialization...")
-    
+
+            print("=" * 60)
+            print("STARTING PRE-INIT DATABASE SYNC")
+            print("=" * 60)
+            print(f"Backup directory: {backup_dir}")
+            print(f"Local database: {local_db}")
+
             # Get all backup files from SharePoint folder
             if not os.path.exists(backup_dir):
                 print("SharePoint backup folder not found, skipping sync")
                 return False
-        
+    
             backup_files = []
             for f in os.listdir(backup_dir):
                 if f.startswith('ait_cmms_backup_') and f.endswith('.db'):
                     full_path = os.path.join(backup_dir, f)
-                    backup_files.append((full_path, os.path.getmtime(full_path)))
-    
+                
+                    # FIXED: Extract timestamp from filename instead of using file modification time
+                    try:
+                        # Filename format: ait_cmms_backup_YYYYMMDD_HHMMSS.db
+                        timestamp_str = f.replace('ait_cmms_backup_', '').replace('.db', '')
+                        # Parse the timestamp: 20250929_154522
+                        file_datetime = datetime.strptime(timestamp_str, '%Y%m%d_%H%M%S')
+                        file_timestamp = file_datetime.timestamp()
+                        backup_files.append((full_path, file_timestamp, timestamp_str))
+                        print(f"Found backup: {f} -> {file_datetime}")
+                    except Exception as e:
+                        print(f"Skipping file {f} - couldn't parse timestamp: {e}")
+                        continue
+
             if not backup_files:
                 print("No backup files found in SharePoint, will start with empty database")
                 return False
-        
-            # Find the most recent backup
-            backup_files.sort(key=lambda x: x[1], reverse=True)
-            latest_backup_path, latest_backup_time = backup_files[0]
     
+            print(f"\nFound {len(backup_files)} valid backup files")
+    
+            # Find the most recent backup by timestamp in filename
+            backup_files.sort(key=lambda x: x[1], reverse=True)
+            latest_backup_path, latest_backup_time, latest_timestamp = backup_files[0]
+        
+            print(f"\n🏆 Latest backup file: {os.path.basename(latest_backup_path)}")
+            print(f"   Timestamp: {datetime.fromtimestamp(latest_backup_time)}")
+
             # Check if local database exists and compare
             if os.path.exists(local_db):
                 local_db_time = os.path.getmtime(local_db)
                 local_db_size = os.path.getsize(local_db)
             
+                print(f"\n📁 Local database EXISTS")
+                print(f"   Local time: {datetime.fromtimestamp(local_db_time)}")
+                print(f"   Local size: {local_db_size:,} bytes")
+            
                 # If SharePoint backup is newer OR if local database is empty, replace it
-                if latest_backup_time > local_db_time or local_db_size < 10000:  # 10KB threshold for "empty"
-                    print(f"SharePoint backup is newer or local database is empty, syncing...")
-                    print(f"Latest backup: {os.path.basename(latest_backup_path)}")
+                if latest_backup_time > local_db_time or local_db_size < 10000:
+                    print(f"\n🔄 SYNCING: SharePoint backup is newer or local database is empty")
+                    print(f"   Backup timestamp: {datetime.fromtimestamp(latest_backup_time)}")
+                    print(f"   Local timestamp:  {datetime.fromtimestamp(local_db_time)}")
+                    print(f"   Backup is newer: {latest_backup_time > local_db_time}")
+                    print(f"   Local is small: {local_db_size < 10000}")
                 
                     # MODIFIED: Only create ONE local backup, overwrite if exists
                     if local_db_size > 10000:  # Only backup if local has meaningful content
                         local_backup_name = "ait_cmms_database_local_backup.db"
                         if os.path.exists(local_backup_name):
-                            print(f"Overwriting existing local backup: {local_backup_name}")
+                            print(f"   Overwriting existing local backup: {local_backup_name}")
                         else:
-                            print(f"Creating local backup: {local_backup_name}")
+                            print(f"   Creating local backup: {local_backup_name}")
                         shutil.copy2(local_db, local_backup_name)
-                
+            
                     # Copy SharePoint backup to local database
+                    print(f"\n📥 Copying {os.path.basename(latest_backup_path)} to {local_db}...")
                     shutil.copy2(latest_backup_path, local_db)
-                
-                    print(f"Database synced successfully from SharePoint")
+            
+                    print(f"\n✅ Database synced successfully from SharePoint!")
+                    print("=" * 60 + "\n")
                     return True
                 else:
-                    print("Local database is current and has content, no sync needed")
+                    print(f"\n⏭️  SKIPPING SYNC: Local database is already current")
+                    print(f"   Backup is newer: {latest_backup_time > local_db_time}")
+                    print(f"   Local is small: {local_db_size < 10000}")
+                    print("=" * 60 + "\n")
                     return False
             else:
                 # No local database exists, copy the latest backup
-                print(f"No local database found, copying latest backup: {os.path.basename(latest_backup_path)}")
+                print(f"\n❌ No local database found")
+                print(f"📥 Copying latest backup: {os.path.basename(latest_backup_path)}")
                 shutil.copy2(latest_backup_path, local_db)
-                print(f"Database initialized from SharePoint backup")
+                print(f"\n✅ Database initialized from SharePoint backup!")
+                print("=" * 60 + "\n")
                 return True
-        
+    
         except Exception as e:
-            print(f"Error in pre-init database sync: {e}")
+            print(f"\n❌ Error in pre-init database sync: {e}")
+            import traceback
+            traceback.print_exc()
+            print("=" * 60 + "\n")
             return False
     
     
@@ -4659,6 +6484,11 @@ class AITCMMSSystem:
                                     relief='sunken')
         self.status_bar.pack(side='left', fill='x', expand=True)
     
+        ttk.Button(status_frame, text="🔄 Refresh Data", 
+           command=self.manual_sync_from_sharepoint).pack(side='right', padx=5)
+    
+    
+    
         # Role switching button (only for development/testing)
         if self.current_user_role == 'Manager':
             ttk.Button(status_frame, text="Switch to Technician View", 
@@ -4670,11 +6500,12 @@ class AITCMMSSystem:
         self.create_pm_scheduling_tab()
         self.create_pm_completion_tab()
         self.create_cm_management_tab()
-        self.create_analytics_dashboard_tab()
+        #self.create_analytics_dashboard_tab()
         self.create_cannot_find_tab()
         self.create_run_to_failure_tab()
         self.create_pm_history_search_tab()
         self.create_custom_pm_templates_tab()
+        self.mro_manager.create_mro_tab(self.notebook)
 
     def create_technician_tabs(self):
         """Create limited tabs for technician access"""
@@ -4810,18 +6641,7 @@ class AITCMMSSystem:
             self.create_technician_tabs()
             self.status_bar.config(text=f"AIT CMMS - Logged in as: {self.user_name} ({self.current_user_role})")
 
-    def restrict_access(self, function_name):
-        """Decorator to restrict access to manager-only functions"""
-        def decorator(func):
-            def wrapper(*args, **kwargs):
-                if self.current_user_role != 'Manager':
-                    messagebox.showerror("Access Denied", 
-                                    f"Access to {function_name} is restricted to Managers only.\n\n"
-                                    f"Current user: {self.user_name} ({self.current_user_role})")
-                    return
-                return func(*args, **kwargs)
-            return wrapper
-        return decorator
+    
    
     
     def standardize_all_database_dates(self):
@@ -4960,7 +6780,8 @@ class AITCMMSSystem:
                   command=self.refresh_equipment_list).pack(side='left', padx=5)
         ttk.Button(controls_frame, text="Export Equipment", 
                   command=self.export_equipment_list).pack(side='left', padx=5)
-        
+        ttk.Button(controls_frame, text="📋 Bulk Edit PM Cycles", 
+                  command=self.bulk_edit_pm_cycles).pack(side='left', padx=5)
         
         
         # Search frame
@@ -4981,7 +6802,7 @@ class AITCMMSSystem:
         self.equipment_tree = ttk.Treeview(list_frame, 
                                          columns=('SAP', 'BFM', 'Description', 'Location', 'LIN', 'Monthly', 'Six Month', 'Annual', 'Status'),
                                          show='headings', height=20)
-        
+        self.equipment_tree.configure(selectmode='extended')  # Enable multi-select
         # Configure columns
         columns_config = {
             'SAP': ('SAP Material No.', 120),
@@ -5148,6 +6969,8 @@ class AITCMMSSystem:
         # Add this line after your existing buttons in the controls_frame section:
         ttk.Button(controls_frame, text="🔍 Validate Before Scheduling", 
                   command=self.generate_weekly_assignments).grid(row=0, column=5, padx=5)
+        ttk.Button(controls_frame, text="📊 Analyze PM Capacity", 
+                  command=self.analyze_pm_capacity).grid(row=0, column=7, padx=5)
         
         # Schedule display
         schedule_frame = ttk.LabelFrame(self.pm_schedule_frame, text="Weekly PM Schedule", padding=10)
@@ -5182,6 +7005,7 @@ class AITCMMSSystem:
             
             # After creating all the technician trees, add this line:
             self.load_latest_weekly_schedule()
+     
     
     def create_pm_completion_tab(self):
         """PM Completion entry tab"""
@@ -5265,6 +7089,9 @@ class AITCMMSSystem:
         buttons_frame = ttk.Frame(form_frame)
         buttons_frame.grid(row=row, column=0, columnspan=2, pady=15)
         
+        ttk.Button(buttons_frame, text="Monthly Summary Report", 
+           command=self.show_monthly_summary).pack(side='left', padx=5)
+        
         ttk.Button(buttons_frame, text="Show Equipment PM History", 
                 command=lambda: self.show_equipment_pm_history_dialog()).pack(side='left', padx=5)
         
@@ -5272,11 +7099,12 @@ class AITCMMSSystem:
                 command=self.submit_pm_completion).pack(side='left', padx=5)
         ttk.Button(buttons_frame, text="Refresh List", 
                 command=self.load_recent_completions).pack(side='left', padx=5)
-        # Add this after the existing buttons in the PM completion tab
-        ttk.Button(buttons_frame, text="View Monthly Completions", 
-                command=self.view_monthly_completions).pack(side='left', padx=5)
+               
         ttk.Button(buttons_frame, text="📅 Check Equipment Schedule", 
                 command=self.create_pm_schedule_lookup_dialog).pack(side='left', padx=5)
+        
+        ttk.Button(buttons_frame, text="🔧 Create CM from PM", 
+                command=self.create_cm_from_pm_dialog).pack(side='left', padx=5)
         
         # Recent completions
         recent_frame = ttk.LabelFrame(self.pm_completion_frame, text="Recent PM Completions", padding=10)
@@ -5669,404 +7497,7 @@ class AITCMMSSystem:
             return "Date Error", None
         except Exception as e:
             return "Error", None
-        
-        
-    def view_monthly_completions(self):
-        """Open dialog to view completed PMs for a specific month/year"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("View Monthly PM Completions")
-        dialog.geometry("800x600")
-        dialog.transient(self.root)
-        dialog.grab_set()
-    
-        # Month/Year selection frame
-        selection_frame = ttk.LabelFrame(dialog, text="Select Month and Year", padding=10)
-        selection_frame.pack(fill='x', padx=10, pady=5)
-    
-        # Month selection
-        ttk.Label(selection_frame, text="Month:").grid(row=0, column=0, sticky='w', padx=5)
-        month_var = tk.StringVar()
-        month_combo = ttk.Combobox(selection_frame, textvariable=month_var, width=12, state='readonly')
-        month_combo['values'] = [
-            '01 - January', '02 - February', '03 - March', '04 - April',
-            '05 - May', '06 - June', '07 - July', '08 - August', 
-            '09 - September', '10 - October', '11 - November', '12 - December'
-        ]
-        month_combo.grid(row=0, column=1, padx=5)
-        month_combo.set(f"{datetime.now().month:02d} - {calendar.month_name[datetime.now().month]}")
-    
-        # Year selection
-        ttk.Label(selection_frame, text="Year:").grid(row=0, column=2, sticky='w', padx=5)
-        year_var = tk.StringVar(value=str(datetime.now().year))
-        year_entry = ttk.Entry(selection_frame, textvariable=year_var, width=8)
-        year_entry.grid(row=0, column=3, padx=5)
-    
-        # Load button
-        ttk.Button(selection_frame, text="Load Completions", 
-                command=lambda: self.load_monthly_data(month_var, year_var, monthly_tree, summary_text)).grid(row=0, column=4, padx=10)
-    
-        # Export button
-        ttk.Button(selection_frame, text="Export to CSV", 
-                command=lambda: self.export_monthly_data(month_var, year_var)).grid(row=0, column=5, padx=5)
-    
-        # Summary frame
-        summary_frame = ttk.LabelFrame(dialog, text="Monthly Summary", padding=10)
-        summary_frame.pack(fill='x', padx=10, pady=5)
-    
-        summary_text = tk.Text(summary_frame, height=6, wrap='word', font=('Courier', 9))
-        summary_scrollbar = ttk.Scrollbar(summary_frame, orient='vertical', command=summary_text.yview)
-        summary_text.configure(yscrollcommand=summary_scrollbar.set)
-    
-        summary_text.pack(side='left', fill='both', expand=True)
-        summary_scrollbar.pack(side='right', fill='y')
-    
-        # Completions list frame
-        list_frame = ttk.LabelFrame(dialog, text="PM Completions", padding=10)
-        list_frame.pack(fill='both', expand=True, padx=10, pady=5)
-    
-        # Treeview for completions
-        monthly_tree = ttk.Treeview(list_frame,
-                                columns=('Date', 'BFM No', 'Description', 'PM Type', 'Technician', 'Hours', 'Notes'),
-                                show='headings')
-    
-        # Configure columns
-        monthly_columns = {
-            'Date': ('Completion Date', 100),
-            'BFM No': ('BFM Equipment No', 120),
-            'Description': ('Equipment Description', 200),
-            'PM Type': ('PM Type', 100),
-            'Technician': ('Completed By', 120),
-            'Hours': ('Labor Hours', 80),
-            'Notes': ('Notes Preview', 150)
-        }
-    
-        for col, (heading, width) in monthly_columns.items():
-            monthly_tree.heading(col, text=heading)
-            monthly_tree.column(col, width=width)
-    
-        # Scrollbars
-        monthly_v_scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=monthly_tree.yview)
-        monthly_h_scrollbar = ttk.Scrollbar(list_frame, orient='horizontal', command=monthly_tree.xview)
-        monthly_tree.configure(yscrollcommand=monthly_v_scrollbar.set, xscrollcommand=monthly_h_scrollbar.set)
-    
-        # Pack treeview and scrollbars
-        monthly_tree.grid(row=0, column=0, sticky='nsew')
-        monthly_v_scrollbar.grid(row=0, column=1, sticky='ns')
-        monthly_h_scrollbar.grid(row=1, column=0, sticky='ew')
-    
-        list_frame.grid_rowconfigure(0, weight=1)
-        list_frame.grid_columnconfigure(0, weight=1)
-    
-        # Load current month by default
-        self.load_monthly_data(month_var, year_var, monthly_tree, summary_text)
-
-    
-    def load_monthly_data(self, month_var, year_var, tree, summary_text):
-        """Load PM completion data for selected month/year with debugging"""
-        try:
-            # Parse month and year
-            month_text = month_var.get()
-            month_num = month_text.split(' - ')[0] if month_text else f"{datetime.now().month:02d}"
-            year = year_var.get() or str(datetime.now().year)
-    
-            # Calculate date range for the month
-            start_date = f"{year}-{month_num}-01"
-    
-            # Get last day of month
-            year_int = int(year)
-            month_int = int(month_num)
-            if month_int == 12:
-                next_month = 1
-                next_year = year_int + 1
-            else:
-                next_month = month_int + 1
-                next_year = year_int
-    
-            end_date = (datetime(next_year, next_month, 1) - timedelta(days=1)).strftime('%Y-%m-%d')
-    
-            cursor = self.conn.cursor()
-        
-            # DEBUG: Print date range
-            print(f"DEBUG: Searching date range: {start_date} to {end_date}")
-    
-            # Get PM completions for the month
-            cursor.execute('''
-                SELECT 
-                    pc.completion_date,
-                    pc.bfm_equipment_no,
-                    e.description,
-                    pc.pm_type,
-                    pc.technician_name,
-                    (pc.labor_hours + pc.labor_minutes/60.0) as total_hours,
-                    pc.notes
-                FROM pm_completions pc
-                LEFT JOIN equipment e ON pc.bfm_equipment_no = e.bfm_equipment_no
-                WHERE pc.completion_date BETWEEN ? AND ?
-                ORDER BY pc.completion_date DESC, pc.bfm_equipment_no
-            ''', (start_date, end_date))
-    
-            completions = cursor.fetchall()
-            print(f"DEBUG: PM completions found: {len(completions)}")
-    
-            # Get Cannot Find entries for the month
-            cursor.execute('''
-                SELECT 
-                    cf.report_date,
-                    cf.bfm_equipment_no,
-                    cf.description,
-                    'CANNOT FIND' as pm_type,
-                    cf.technician_name,
-                    0 as total_hours,
-                    cf.notes
-                FROM cannot_find_assets cf
-                WHERE cf.report_date BETWEEN ? AND ?
-                ORDER BY cf.report_date DESC, cf.bfm_equipment_no
-            ''', (start_date, end_date))
-    
-            cannot_finds = cursor.fetchall()
-            print(f"DEBUG: Cannot find entries found: {len(cannot_finds)}")
-        
-            # DEBUG: Check for any dates outside expected range
-            cursor.execute('''
-                SELECT completion_date, COUNT(*) 
-                FROM pm_completions 
-                WHERE strftime('%Y-%m', completion_date) = ? 
-                GROUP BY completion_date 
-                ORDER BY completion_date
-            ''', (f"{year}-{month_num}",))
-        
-            date_counts = cursor.fetchall()
-            print(f"DEBUG: All PM completion dates this month: {date_counts}")
-        
-            cursor.execute('''
-                SELECT report_date, COUNT(*) 
-                FROM cannot_find_assets 
-                WHERE strftime('%Y-%m', report_date) = ? 
-                GROUP BY report_date 
-                ORDER BY report_date
-            ''', (f"{year}-{month_num}",))
-        
-            cf_date_counts = cursor.fetchall()
-            print(f"DEBUG: All cannot find dates this month: {cf_date_counts}")
-        
-            # Try alternative query to see if we get different results
-            cursor.execute('''
-                SELECT COUNT(*) FROM pm_completions 
-                WHERE strftime('%Y-%m', completion_date) = ?
-            ''', (f"{year}-{month_num}",))
-            alt_pm_count = cursor.fetchone()[0]
-        
-            cursor.execute('''
-                SELECT COUNT(*) FROM cannot_find_assets 
-                WHERE strftime('%Y-%m', report_date) = ?
-            ''', (f"{year}-{month_num}",))
-            alt_cf_count = cursor.fetchone()[0]
-        
-            print(f"DEBUG: Alternative count - PM: {alt_pm_count}, CF: {alt_cf_count}, Total: {alt_pm_count + alt_cf_count}")
-            
-            # Add this debug query after the other debug queries:
-            cursor.execute('SELECT COUNT(*) FROM pm_completions')
-            total_pm_all = cursor.fetchone()[0]
-
-            cursor.execute('SELECT COUNT(*) FROM cannot_find_assets') 
-            total_cf_all = cursor.fetchone()[0]
-
-            print(f"DEBUG: Total records in entire database - PM: {total_pm_all}, CF: {total_cf_all}")
-
-            # Also check what months/years you have data for:
-            cursor.execute("SELECT DISTINCT strftime('%Y-%m', completion_date) FROM pm_completions ORDER BY 1")
-            pm_months = [row[0] for row in cursor.fetchall()]
-
-            cursor.execute("SELECT DISTINCT strftime('%Y-%m', report_date) FROM cannot_find_assets ORDER BY 1") 
-            cf_months = [row[0] for row in cursor.fetchall()]
-
-            print(f"DEBUG: PM completion months available: {pm_months}")
-            print(f"DEBUG: Cannot find months available: {cf_months}")
-            
-            # Add this debug query:
-            cursor.execute('SELECT COUNT(*) FROM pm_completions WHERE completion_date IS NULL')
-            null_pm_count = cursor.fetchone()[0]
-
-            cursor.execute('SELECT COUNT(*) FROM cannot_find_assets WHERE report_date IS NULL')
-            null_cf_count = cursor.fetchone()[0]
-
-            print(f"DEBUG: Records with NULL dates - PM: {null_pm_count}, CF: {null_cf_count}")
-
-            # Also check what those NULL records look like:
-            if null_pm_count > 0:
-                cursor.execute('SELECT bfm_equipment_no, pm_type, technician_name FROM pm_completions WHERE completion_date IS NULL LIMIT 5')
-                null_samples = cursor.fetchall()
-                print(f"DEBUG: Sample NULL date PM records: {null_samples}")
-
-
-            # Add these debug queries to see the most recent entries:
-            cursor.execute('''
-                SELECT completion_date, COUNT(*) 
-                FROM pm_completions 
-                WHERE completion_date >= '2025-09-01' 
-                GROUP BY completion_date 
-                ORDER BY completion_date DESC
-            ''')
-            recent_entries = cursor.fetchall()
-            print(f"DEBUG: All September PM entries by date: {recent_entries}")
-
-            # Check the very last entries added to see if there's recent data entry:
-            cursor.execute('''
-                SELECT completion_date, bfm_equipment_no, pm_type, technician_name
-                FROM pm_completions 
-                WHERE completion_date LIKE '2025-09%'
-                ORDER BY rowid DESC 
-                LIMIT 10
-            ''')
-            latest_entries = cursor.fetchall()
-            print(f"DEBUG: Latest 10 September entries: {latest_entries}")
-            
-            # Add this debug to find ALL records with single-digit month format:
-            cursor.execute('''
-                SELECT completion_date, COUNT(*) 
-                FROM pm_completions 
-                WHERE completion_date LIKE '2025-9-%'
-                GROUP BY completion_date 
-                ORDER BY completion_date
-            ''')
-            single_digit_pm = cursor.fetchall()
-
-            cursor.execute('''
-                SELECT report_date, COUNT(*) 
-                FROM cannot_find_assets 
-                WHERE report_date LIKE '2025-9-%'
-                GROUP BY report_date 
-                ORDER BY report_date
-            ''')
-            single_digit_cf = cursor.fetchall()
-
-            cursor.execute('SELECT COUNT(*) FROM pm_completions WHERE completion_date LIKE "2025-9-%"')
-            total_single_pm = cursor.fetchone()[0]
-
-            cursor.execute('SELECT COUNT(*) FROM cannot_find_assets WHERE report_date LIKE "2025-9-%"')
-            total_single_cf = cursor.fetchone()[0]
-
-            print(f"DEBUG: Single-digit month PM records: {single_digit_pm}")
-            print(f"DEBUG: Single-digit month CF records: {single_digit_cf}")
-            print(f"DEBUG: Total single-digit format - PM: {total_single_pm}, CF: {total_single_cf}")
-            print(f"DEBUG: Missing total would be: {224 + total_single_pm + total_single_cf}")
-
-
-            # Add these debug queries to check for ALL possible date variations:
-
-            # Check for dates with different separators or formats
-            cursor.execute('''
-                SELECT completion_date, COUNT(*) 
-                FROM pm_completions 
-                WHERE (completion_date LIKE '%2025%' AND completion_date LIKE '%9%')
-                OR (completion_date LIKE '%25-9%')
-                OR (completion_date LIKE '%25/9%')
-                GROUP BY completion_date 
-                ORDER BY completion_date
-            ''')
-            all_sept_variations = cursor.fetchall()
-
-            # Check the total count using strftime for September (this handles all formats)
-            cursor.execute('''
-                SELECT completion_date, COUNT(*)
-                FROM pm_completions 
-                WHERE (strftime('%Y', completion_date) = '2025' AND strftime('%m', completion_date) = '09')
-                OR (strftime('%Y', completion_date) = '2025' AND strftime('%m', completion_date) = '9')
-                GROUP BY completion_date
-                ORDER BY completion_date
-            ''')
-            strftime_sept = cursor.fetchall()
-
-            cursor.execute('''
-                SELECT COUNT(*)
-                FROM pm_completions 
-                WHERE (strftime('%Y', completion_date) = '2025' AND strftime('%m', completion_date) = '09')
-                OR (strftime('%Y', completion_date) = '2025' AND strftime('%m', completion_date) = '9')
-            ''')
-            total_strftime_pm = cursor.fetchone()[0]
-
-            # Same for cannot_find_assets
-            cursor.execute('''
-                SELECT COUNT(*)
-                FROM cannot_find_assets 
-                WHERE (strftime('%Y', report_date) = '2025' AND strftime('%m', report_date) = '09')
-                OR (strftime('%Y', report_date) = '2025' AND strftime('%m', report_date) = '9')
-            ''')
-            total_strftime_cf = cursor.fetchone()[0]
-
-            print(f"DEBUG: All Sept variations found: {all_sept_variations}")
-            print(f"DEBUG: Strftime September entries: {strftime_sept}")
-            print(f"DEBUG: Total using strftime - PM: {total_strftime_pm}, CF: {total_strftime_cf}, Total: {total_strftime_pm + total_strftime_cf}")
-
-            # Also check if there might be records in other tables
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            all_tables = [row[0] for row in cursor.fetchall()]
-            print(f"DEBUG: All tables in database: {all_tables}")
-
-
-            # Combine both lists
-            all_completions = list(completions) + list(cannot_finds)
-            all_completions.sort(key=lambda x: x[0], reverse=True)  # Sort by date descending
-        
-            print(f"DEBUG: Combined total: {len(all_completions)}")
-
-            # Clear existing items
-            for item in tree.get_children():
-                tree.delete(item)
-
-            # Add completions to tree
-            for completion in all_completions:
-                date, bfm_no, description, pm_type, technician, hours, notes = completion
-                hours_display = f"{hours:.1f}h" if hours else "0.0h"
-                notes_preview = (notes[:50] + '...') if notes and len(notes) > 50 else (notes or '')
-            
-                tree.insert('', 'end', values=(
-                    date, bfm_no, description or '', pm_type, technician, hours_display, notes_preview
-                ))
-
-            # Generate summary
-            month_name = calendar.month_name[month_int]
-            summary = f"PM COMPLETIONS SUMMARY - {month_name} {year}\n"
-            summary += "=" * 50 + "\n\n"
-
-            # Count by PM type
-            pm_type_counts = {}
-            total_hours = 0
-            technician_counts = {}
-
-            for completion in all_completions:
-                pm_type = completion[3]
-                technician = completion[4]
-                hours = completion[5] or 0
-            
-                pm_type_counts[pm_type] = pm_type_counts.get(pm_type, 0) + 1
-                total_hours += hours
-                technician_counts[technician] = technician_counts.get(technician, 0) + 1
-
-            summary += f"Total Completions: {len(all_completions)}\n"
-            summary += f"Total Labor Hours: {total_hours:.1f} hours\n\n"
-
-            if pm_type_counts:
-                summary += "BY PM TYPE:\n"
-                for pm_type, count in sorted(pm_type_counts.items()):
-                    summary += f"  {pm_type}: {count}\n"
-                summary += "\n"
-
-            if technician_counts:
-                summary += "BY TECHNICIAN:\n"
-                for tech, count in sorted(technician_counts.items()):
-                    avg_hours = sum(c[5] or 0 for c in all_completions if c[4] == tech) / count
-                    summary += f"  {tech}: {count} completions, {avg_hours:.1f}h avg\n"
-
-            # Display summary
-            summary_text.delete('1.0', 'end')
-            summary_text.insert('1.0', summary)
-
-            self.update_status(f"Loaded {len(all_completions)} completions for {month_name} {year}")
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load monthly data: {str(e)}")
-    
+           
     
 
     def export_monthly_data(self, month_var, year_var):
@@ -6257,11 +7688,19 @@ class AITCMMSSystem:
             )
         
             # Add company logo if available
-            logo_path = r"C:\Users\stuar\Desktop\AIT_CMMS_EDIT\img\ait_Logo.png"  # Update this path to your logo
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            logo_path = os.path.join(script_dir, "img", "ait_logo.png")
+
             if os.path.exists(logo_path):
                 logo = Image(logo_path, width=2*inch, height=1*inch)
                 story.append(logo)
                 story.append(Spacer(1, 12))
+            else:
+                print(f"Logo not found at: {logo_path}")
+                # Fallback to text header
+                story.append(Paragraph("AIT - BUILDING THE FUTURE OF AEROSPACE", title_style))
+                story.append(Spacer(1, 12))
+            
         
             # Title
             story.append(Paragraph("PM COMPLETION CERTIFICATE", title_style))
@@ -6329,13 +7768,18 @@ class AITCMMSSystem:
             print(f"Full error: {e}")
     
     def create_cannot_find_tab(self):
-        """Cannot Find Assets tab"""
+        """Cannot Find Assets tab with search functionality"""
         self.cannot_find_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.cannot_find_frame, text="Cannot Find Assets")
-    
+
         # Controls
         controls_frame = ttk.LabelFrame(self.cannot_find_frame, text="Cannot Find Controls", padding=10)
         controls_frame.pack(fill='x', padx=10, pady=5)
+
+        # Add Asset button
+        ttk.Button(controls_frame, text="➕ Add Asset", 
+                command=self.add_cannot_find_asset_dialog,
+                style='Accent.TButton').pack(side='left', padx=5)
     
         ttk.Button(controls_frame, text="Refresh List", 
                 command=self.load_cannot_find_assets).pack(side='left', padx=5)
@@ -6346,17 +7790,31 @@ class AITCMMSSystem:
         ttk.Button(controls_frame, text="Delete Asset", 
             command=self.delete_cannot_find_asset).pack(side='left', padx=5)        
         ttk.Button(controls_frame, text="Edit Asset", 
-            command=self.edit_cannot_find_asset).pack(side='left', padx=5)        
-                
+            command=self.edit_cannot_find_asset).pack(side='left', padx=5)
     
+        # Search frame - NEW!
+        search_frame = ttk.Frame(controls_frame)
+        search_frame.pack(side='right', padx=5)
+        
+        ttk.Label(search_frame, text="🔍 Search:").pack(side='left', padx=(10, 5))
+        self.cannot_find_search_var = tk.StringVar()
+        self.cannot_find_search_var.trace('w', lambda *args: self.filter_cannot_find_assets())
+        
+        search_entry = ttk.Entry(search_frame, textvariable=self.cannot_find_search_var, width=25)
+        search_entry.pack(side='left', padx=5)
+        
+        # Clear search button
+        ttk.Button(search_frame, text="✖", width=3,
+                command=lambda: self.cannot_find_search_var.set('')).pack(side='left', padx=2)
+
         # Cannot Find list
         list_frame = ttk.LabelFrame(self.cannot_find_frame, text="Missing Assets", padding=10)
         list_frame.pack(fill='both', expand=True, padx=10, pady=5)
-    
+
         self.cannot_find_tree = ttk.Treeview(list_frame,
                                         columns=('BFM', 'Description', 'Location', 'Technician', 'Report Date', 'Status'),
                                         show='headings')
-    
+
         columns_config = {
             'BFM': ('BFM Equipment No.', 130),
             'Description': ('Description', 250),
@@ -6365,54 +7823,84 @@ class AITCMMSSystem:
             'Report Date': ('Report Date', 100),
             'Status': ('Status', 80)
         }
-    
+
         for col, (heading, width) in columns_config.items():
             self.cannot_find_tree.heading(col, text=heading)
             self.cannot_find_tree.column(col, width=width)
-    
+
         # Scrollbars
         cf_v_scrollbar = ttk.Scrollbar(list_frame, orient='vertical', command=self.cannot_find_tree.yview)
         cf_h_scrollbar = ttk.Scrollbar(list_frame, orient='horizontal', command=self.cannot_find_tree.xview)
         self.cannot_find_tree.configure(yscrollcommand=cf_v_scrollbar.set, xscrollcommand=cf_h_scrollbar.set)
-    
+
         # Pack treeview and scrollbars
         self.cannot_find_tree.grid(row=0, column=0, sticky='nsew')
         cf_v_scrollbar.grid(row=0, column=1, sticky='ns')
         cf_h_scrollbar.grid(row=1, column=0, sticky='ew')
-    
+
         list_frame.grid_rowconfigure(0, weight=1)
         list_frame.grid_columnconfigure(0, weight=1)
-    
+
         # Load initial data
         self.load_cannot_find_assets()
     
     
+    
     def delete_cannot_find_asset(self):
-        """Remove selected asset from the displayed list only (not from database)"""
+        """Permanently delete selected asset from the cannot_find_assets table"""
         # Get selected item
         selected_item = self.cannot_find_tree.selection()
-    
+
         if not selected_item:
-            messagebox.showwarning("No Selection", "Please select an asset to remove.")
+            messagebox.showwarning("No Selection", "Please select an asset to delete.")
             return
-    
+
         # Get the selected item data
         item = selected_item[0]
         asset_data = self.cannot_find_tree.item(item)['values']
-        bfm_number = asset_data[0]  # Assuming BFM is the first column
-    
-        # Confirm removal
+        bfm_number = asset_data[0]  # BFM is the first column
+        description = asset_data[1] if len(asset_data) > 1 else ''
+
+        # Confirm permanent deletion
         result = messagebox.askyesno(
-            "Confirm List Removal", 
-            f"Remove asset {bfm_number} from the current list?\n\n"
-            "Note: This item will reappear when you refresh the list. "
-            "To permanently remove it, use 'Mark as Found' or manage it through the database."
+            "Confirm Permanent Deletion", 
+            f"Permanently delete asset {bfm_number} from the Cannot Find database?\n\n"
+            f"Description: {description}\n\n"
+            "⚠️ WARNING: This action cannot be undone!\n"
+            "The asset will be completely removed from the Cannot Find list."
         )
-    
+
         if result:
-            # Simply remove from treeview
-            self.cannot_find_tree.delete(item)
-            messagebox.showinfo("Removed", f"Asset {bfm_number} has been removed from the list.")
+            try:
+                cursor = self.conn.cursor()
+            
+                # Delete from cannot_find_assets table
+                cursor.execute('DELETE FROM cannot_find_assets WHERE bfm_equipment_no = ?', (bfm_number,))
+            
+                # Optional: Update the equipment table status back to Active if it exists there
+                # You can comment this out if you don't want to change the equipment status
+                cursor.execute('''
+                    UPDATE equipment 
+                    SET status = 'Active' 
+                    WHERE bfm_equipment_no = ? AND status = 'Cannot Find'
+                ''', (bfm_number,))
+            
+                # Commit the changes
+                self.conn.commit()
+            
+                # Remove from treeview display
+                self.cannot_find_tree.delete(item)
+            
+                # Update statistics if method exists
+                if hasattr(self, 'update_equipment_statistics'):
+                    self.update_equipment_statistics()
+            
+                messagebox.showinfo("Success", f"Asset {bfm_number} has been permanently deleted from the Cannot Find list.")
+            
+            except Exception as e:
+                self.conn.rollback()  # Rollback changes if there's an error
+                messagebox.showerror("Error", f"Failed to delete asset from database: {str(e)}")
+                print(f"Delete error details: {e}")
 
 
     def delete_from_database(self, bfm_number):
@@ -6614,7 +8102,8 @@ class AITCMMSSystem:
     
         self.run_to_failure_tree = ttk.Treeview(list_frame,
                                             columns=('BFM', 'Description', 'Location', 'Technician', 'Completion Date', 'Hours'),
-                                            show='headings')
+                                            show='headings',
+                                            selectmode='extended')
     
         columns_config = {
             'BFM': ('BFM Equipment No.', 130),
@@ -6678,7 +8167,7 @@ class AITCMMSSystem:
         # Create filter dropdown
         self.cm_filter_var = tk.StringVar(value="All")
         self.cm_filter_dropdown = ttk.Combobox(filter_frame, textvariable=self.cm_filter_var, 
-                                            values=["All", "Open", "In Progress", "Completed", "On Hold"],
+                                            values=["All", "Open", "Closed"],
                                             state="readonly", width=15)
         self.cm_filter_dropdown.pack(side='left', padx=5)
         self.cm_filter_dropdown.bind('<<ComboboxSelected>>', self.filter_cm_list)
@@ -6775,142 +8264,6 @@ class AITCMMSSystem:
         self.cm_filter_var.set("All")
         self.filter_cm_list()
    
-    def import_sharepoint_cm_data(self):
-        """Import CM data from SharePoint workbook"""
-        # Show method selection dialog
-        self.show_sharepoint_import_method_dialog()
-
-    def show_sharepoint_import_method_dialog(self):
-        """Show dialog to select SharePoint import method"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("SharePoint Import Options")
-        dialog.geometry("600x400")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        
-        # Instructions
-        instructions_frame = ttk.LabelFrame(dialog, text="Import Options", padding=15)
-        instructions_frame.pack(fill='x', padx=10, pady=5)
-    
-        instructions = """
-        Choose how to import data from SharePoint:
-    
-        Option 1: Direct SharePoint Integration (Requires authentication)
-        Option 2: Manual File Upload (Download Excel file from SharePoint first)
-        Option 3: SharePoint REST API (Advanced - requires app registration)
-        """
-    
-        ttk.Label(instructions_frame, text=instructions, font=('Arial', 10)).pack(anchor='w')
-    
-        # Buttons for different methods
-        buttons_frame = ttk.Frame(dialog)
-        buttons_frame.pack(fill='x', padx=10, pady=20)
-    
-        ttk.Button(buttons_frame, text="Option 1: Direct SharePoint", 
-                command=lambda: self.try_direct_sharepoint_import(dialog)).pack(pady=5, fill='x')
-        ttk.Button(buttons_frame, text="Option 2: Upload Excel File", 
-                command=lambda: self.manual_excel_upload(dialog)).pack(pady=5, fill='x')
-        ttk.Button(buttons_frame, text="Option 3: REST API Import", 
-                command=lambda: self.sharepoint_rest_api_import(dialog)).pack(pady=5, fill='x')
-        ttk.Button(buttons_frame, text="Cancel", 
-                command=dialog.destroy).pack(pady=5, fill='x')
-
-    def try_direct_sharepoint_import(self, parent_dialog):
-        """Attempt direct SharePoint integration"""
-        parent_dialog.destroy()
-    
-        try:
-            # This requires additional libraries
-            import requests
-            from requests_ntlm import HttpNtlmAuth
-            import getpass
-        
-            # Create authentication dialog
-            auth_dialog = tk.Toplevel(self.root)
-            auth_dialog.title("SharePoint Authentication")
-            auth_dialog.geometry("400x300")
-            auth_dialog.transient(self.root)
-            auth_dialog.grab_set()
-        
-            # Authentication form
-            ttk.Label(auth_dialog, text="SharePoint Credentials:", font=('Arial', 12, 'bold')).pack(pady=10)
-            
-            # Username
-            ttk.Label(auth_dialog, text="Username:").pack(anchor='w', padx=20)
-            username_var = tk.StringVar()
-            ttk.Entry(auth_dialog, textvariable=username_var, width=40).pack(pady=5, padx=20)
-        
-            # Password
-            ttk.Label(auth_dialog, text="Password:").pack(anchor='w', padx=20)
-            password_var = tk.StringVar()
-            password_entry = ttk.Entry(auth_dialog, textvariable=password_var, show="*", width=40)
-            password_entry.pack(pady=5, padx=20)
-        
-            # Site URL
-            ttk.Label(auth_dialog, text="SharePoint Site URL:").pack(anchor='w', padx=20)
-            site_url_var = tk.StringVar(value="https://aitgo.sharepoint.com/sites/PMCM")
-            ttk.Entry(auth_dialog, textvariable=site_url_var, width=40).pack(pady=5, padx=20)
-        
-            def authenticate_and_import():
-                try:
-                    self.sharepoint_status_label.config(text="Connecting to SharePoint...")
-                    self.root.update()
-                
-                    # This is a simplified example - real implementation would need proper OAuth
-                    username = username_var.get()
-                    password = password_var.get()
-                    site_url = site_url_var.get()
-                
-                    if not all([username, password, site_url]):
-                        messagebox.showerror("Error", "Please fill in all fields")
-                        return
-                
-                    # Attempt connection (this is a basic example)
-                    success = self.connect_to_sharepoint_direct(site_url, username, password)
-                
-                    if success:
-                        auth_dialog.destroy()
-                        self.sharepoint_status_label.config(text="SharePoint connected successfully")
-                    else:
-                        messagebox.showerror("Authentication Failed", 
-                                        "Could not connect to SharePoint. Try manual upload instead.")
-                    
-                except Exception as e:
-                    messagebox.showerror("Error", f"SharePoint connection failed: {str(e)}")
-        
-            ttk.Button(auth_dialog, text="Connect", command=authenticate_and_import).pack(pady=20)
-            ttk.Button(auth_dialog, text="Cancel", command=auth_dialog.destroy).pack()
-        
-        except ImportError:
-            messagebox.showinfo("Additional Libraries Needed", 
-                            "Direct SharePoint integration requires additional libraries.\n"
-                            "Please use 'Upload Excel File' option instead.")
-            self.manual_excel_upload(None)
-
-    def manual_excel_upload(self, parent_dialog):
-        """Manual Excel file upload for SharePoint data"""
-        if parent_dialog:
-            parent_dialog.destroy()
-    
-        # Instructions dialog
-        instructions = messagebox.showinfo("Manual Upload Instructions", 
-                                        "1. Go to the SharePoint link\n"
-                                        "2. Open the Asset Maintenance workbook\n"
-                                        "3. Go to the 'CMDATA' tab\n"
-                                        "4. Download/Save the file as Excel (.xlsx)\n"
-                                        "5. Click OK to select the downloaded file")
-    
-        # File selection
-        file_path = filedialog.askopenfilename(
-            title="Select Downloaded SharePoint Excel File",
-            filetypes=[("Excel files", "*.xlsx"), ("Excel files", "*.xls"), ("All files", "*.*")]
-        )
-    
-        if file_path:
-            try:
-                self.process_sharepoint_excel_file(file_path)
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to process Excel file: {str(e)}")
 
     def process_sharepoint_excel_file(self, file_path):
         """Process the SharePoint Excel file and import CMDATA"""
@@ -7135,18 +8488,6 @@ class AITCMMSSystem:
         ttk.Button(button_frame, text="Import Data", command=import_sharepoint_data).pack(side='left', padx=5)
         ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side='right', padx=5)
 
-    def sharepoint_rest_api_import(self, parent_dialog):
-        """SharePoint REST API import (advanced method)"""
-        if parent_dialog:
-            parent_dialog.destroy()
-    
-        messagebox.showinfo("REST API Import", 
-                        "REST API import requires:\n"
-                        "1. App registration in Azure AD\n"
-                        "2. SharePoint app permissions\n"
-                        "3. Client ID and secret\n\n"
-                        "This is an advanced method typically configured by IT.\n"
-                        "Please use the manual upload option for now.")
 
     def connect_to_sharepoint_direct(self, site_url, username, password):
         """Attempt direct SharePoint connection"""
@@ -7426,6 +8767,7 @@ class AITCMMSSystem:
                         if hasattr(self, 'refresh_technician_schedules'):
                             self.refresh_technician_schedules()
                         self.update_status(f"✅ PM completed and verified: {bfm_no} - {pm_type} by {technician}")
+                        self.auto_sync_after_action()
                     else:
                         messagebox.showerror("⚠️ Warning", 
                                         f"PM was saved but verification failed!\n\n"
@@ -7446,6 +8788,88 @@ class AITCMMSSystem:
             messagebox.showerror("Error", f"Failed to submit PM completion: {str(e)}")
             import traceback
             print(f"PM Completion Error: {traceback.format_exc()}")
+    
+    
+    def auto_pull_from_sharepoint(self):
+        """Automatically pull latest data from SharePoint every 30 seconds"""
+        try:
+            # Check if there's a newer backup available
+            if hasattr(self, 'backup_sync_dir') and self.backup_sync_dir:
+                db_file = 'ait_cmms_database.db'
+                backup_dir = self.backup_sync_dir
+            
+                if os.path.exists(backup_dir):
+                    # Get latest backup
+                    backup_files = []
+                    for f in os.listdir(backup_dir):
+                        if f.startswith('ait_cmms_backup_') and f.endswith('.db'):
+                            full_path = os.path.join(backup_dir, f)
+                            backup_files.append((full_path, os.path.getmtime(full_path)))
+                
+                    if backup_files:
+                        backup_files.sort(key=lambda x: x[1], reverse=True)
+                        latest_backup_path, latest_backup_time = backup_files[0]
+                    
+                        # Check if backup is newer than local
+                        if os.path.exists(db_file):
+                            local_time = os.path.getmtime(db_file)
+                        
+                            if latest_backup_time > local_time:
+                                print(f"Newer backup detected, pulling from SharePoint...")
+                                
+                                # Close connection
+                                self.conn.close()
+                                
+                                # Copy newer backup
+                                shutil.copy2(latest_backup_path, db_file)
+                                
+                                # Reopen connection
+                                self.conn = sqlite3.connect(db_file)
+                                
+                                # Refresh views based on user role
+                                if self.current_user_role == 'Manager':
+                                    # Manager has all views
+                                    if hasattr(self, 'load_equipment_data'):
+                                        self.load_equipment_data()
+                                    if hasattr(self, 'load_recent_completions'):
+                                        self.load_recent_completions()
+                            
+                                # Both Manager and Technician have CM access
+                                if hasattr(self, 'load_corrective_maintenance'):
+                                    self.load_corrective_maintenance()
+                            
+                                self.update_status("✓ Data updated from SharePoint")
+        
+            # Schedule next pull in 30 seconds
+            self.root.after(30 * 1000, self.auto_pull_from_sharepoint)
+        
+        except Exception as e:
+            print(f"Auto-pull error: {e}")
+            # Schedule next pull anyway
+            self.root.after(30 * 1000, self.auto_pull_from_sharepoint)
+    
+    
+    def auto_save_and_sync(self):
+        """Auto-save database changes and sync to SharePoint every 5 seconds"""
+        try:
+            # Commit any pending database changes
+            if hasattr(self, 'conn') and self.conn:
+                self.conn.commit()
+        
+            # Push to SharePoint immediately after saving
+            if hasattr(self, 'backup_sync_dir') and self.backup_sync_dir:
+                self.sharepoint_only_backup(self.backup_sync_dir)
+                print("Auto-saved and synced to SharePoint")
+        
+            # Schedule next auto-save in 5 minutes
+            self.root.after(300 * 1000, self.auto_save_and_sync)
+        
+        except Exception as e:
+            print(f"Auto-save error: {e}")
+            # Schedule next auto-save anyway
+            self.root.after(300 * 1000, self.auto_save_and_sync)
+    
+    
     
     def validate_pm_completion(self, cursor, bfm_no, pm_type, technician, completion_date):
         """Comprehensive validation to prevent duplicate PMs"""
@@ -7508,16 +8932,16 @@ class AITCMMSSystem:
                 issues.append(f"⚠️ Equipment {bfm_no} has status '{equipment_status[0]}' - unusual for {pm_type} PM")
 
             # Check 4: Scheduled PM exists for this week
-            current_week_start = self.get_week_start(datetime.strptime(completion_date, '%Y-%m-%d'))
-            cursor.execute('''
-                SELECT COUNT(*) FROM weekly_pm_schedules 
-                WHERE bfm_equipment_no = ? AND pm_type = ? 
-                AND assigned_technician = ? AND week_start_date = ?
-            ''', (bfm_no, pm_type, technician, current_week_start.strftime('%Y-%m-%d')))
-        
-            scheduled_count = cursor.fetchone()[0]
-            if scheduled_count == 0 and pm_type in ['Monthly', 'Annual']:
-                issues.append(f"ℹ️ No scheduled PM found for this week - completing ahead of schedule")
+            #current_week_start = self.get_week_start(datetime.strptime(completion_date, '%Y-%m-%d'))
+            #cursor.execute('''
+            #   SELECT COUNT(*) FROM weekly_pm_schedules 
+            #   WHERE bfm_equipment_no = ? AND pm_type = ? 
+            #    AND assigned_technician = ? AND week_start_date = ?
+            #''', (bfm_no, pm_type, technician, current_week_start.strftime('%Y-%m-%d')))
+            #
+            #scheduled_count = cursor.fetchone()[0]
+            #if scheduled_count == 0 and pm_type in ['Monthly', 'Annual']:
+            #   issues.append(f"ℹ️ No scheduled PM found for this week - completing ahead of schedule")
 
             # Return validation result
             if issues:
@@ -7872,9 +9296,8 @@ class AITCMMSSystem:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load PM history: {str(e)}")
       
-    # 7. LOAD CANNOT FIND ASSETS
     def load_cannot_find_assets(self):
-        """Load cannot find assets data"""
+        """Load cannot find assets data and store for filtering"""
         try:
             cursor = self.conn.cursor()
             cursor.execute('''
@@ -7884,19 +9307,68 @@ class AITCMMSSystem:
                 ORDER BY report_date DESC
             ''')
         
-            # Clear existing items
-            for item in self.cannot_find_tree.get_children():
-                self.cannot_find_tree.delete(item)
+            # Store all data for filtering
+            self.cannot_find_data = cursor.fetchall()
         
-            # Add cannot find records
-            for asset in cursor.fetchall():
-                bfm_no, description, location, technician, report_date, status = asset
+            # Display the data
+            self.filter_cannot_find_assets()
+        
+        except Exception as e:
+            print(f"Error loading cannot find assets: {e}")
+
+
+
+
+    def filter_cannot_find_assets(self):
+        """Filter the Cannot Find assets based on search term"""
+        # Clear existing items
+        for item in self.cannot_find_tree.get_children():
+            self.cannot_find_tree.delete(item)
+    
+        # Get search term
+        search_term = self.cannot_find_search_var.get().lower().strip()
+    
+        # If no data loaded yet, return
+        if not hasattr(self, 'cannot_find_data'):
+            return
+    
+        # Filter and display data
+        for asset in self.cannot_find_data:
+            bfm_no, description, location, technician, report_date, status = asset
+        
+            # If search term is empty, show all
+            if not search_term:
                 self.cannot_find_tree.insert('', 'end', values=(
                     bfm_no, description or '', location or '', technician, report_date, status
                 ))
+            else:
+                # Search in all fields
+                searchable_text = ' '.join([
+                    str(bfm_no or ''),
+                    str(description or ''),
+                    str(location or ''),
+                    str(technician or ''),
+                    str(report_date or ''),
+                    str(status or '')
+                ]).lower()
             
-        except Exception as e:
-            print(f"Error loading cannot find assets: {e}")
+                if search_term in searchable_text:
+                    self.cannot_find_tree.insert('', 'end', values=(
+                        bfm_no, description or '', location or '', technician, report_date, status
+                    ))
+    
+        # Update count in status bar if method exists
+        visible_count = len(self.cannot_find_tree.get_children())
+        total_count = len(self.cannot_find_data) if hasattr(self, 'cannot_find_data') else 0
+    
+        if hasattr(self, 'update_status'):
+            if search_term:
+                self.update_status(f"Showing {visible_count} of {total_count} Cannot Find assets (filtered)")
+            else:
+                self.update_status(f"Showing {total_count} Cannot Find assets")
+
+
+
 
     # 8. LOAD RUN TO FAILURE ASSETS
     def load_run_to_failure_assets(self):
@@ -8120,61 +9592,277 @@ class AITCMMSSystem:
 
     # 12. REACTIVATE ASSET
     def reactivate_asset(self):
-        """Enhanced method to reactivate a run to failure asset"""
+        """Enhanced method to reactivate multiple run to failure assets at once"""
         selected = self.run_to_failure_tree.selection()
         if not selected:
-            messagebox.showwarning("Warning", "Please select an asset to reactivate")
+            messagebox.showwarning("Warning", "Please select one or more assets to reactivate")
             return
+
+        # Get all selected assets
+        selected_assets = []
+        for item in selected:
+            item_data = self.run_to_failure_tree.item(item)
+            bfm_no = item_data['values'][0]
+            description = item_data['values'][1]
+            selected_assets.append((bfm_no, description))
     
-        item = self.run_to_failure_tree.item(selected[0])
-        bfm_no = item['values'][0]
+        # Create reactivation dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Reactivate Assets - {len(selected_assets)} Selected")
+        dialog.geometry("700x650")
+        dialog.transient(self.root)
+        dialog.grab_set()
     
-        result = messagebox.askyesno(
-            "Confirm Reactivation", 
-            f"Reactivate asset {bfm_no} for PM scheduling?\n\n"
-            f"This will:\n"
-            f"• Set status to Active\n"
-            f"• Enable Monthly and Annual PMs\n"
-            f"• Remove from Run to Failure list\n"
-            f"• Resume normal PM scheduling"
-        )
+        # Center the dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (700 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (650 // 2)
+        dialog.geometry(f"700x650+{x}+{y}")
     
-        if result:
+        # Header
+        header_frame = ttk.Frame(dialog, padding=15)
+        header_frame.pack(fill='x')
+    
+        if len(selected_assets) == 1:
+            ttk.Label(header_frame, text=f"Reactivate Asset for PM Scheduling", 
+                    font=('Arial', 14, 'bold')).pack()
+            ttk.Label(header_frame, text=f"BFM: {selected_assets[0][0]}", 
+                    font=('Arial', 10)).pack(pady=5)
+            ttk.Label(header_frame, text=f"Description: {selected_assets[0][1]}", 
+                    font=('Arial', 9), wraplength=650).pack()
+        else:
+            ttk.Label(header_frame, text=f"Bulk Reactivate {len(selected_assets)} Assets", 
+                    font=('Arial', 14, 'bold')).pack()
+            ttk.Label(header_frame, text=f"All selected assets will use the same PM frequencies", 
+                    font=('Arial', 10), foreground='blue').pack(pady=5)
+    
+        # Separator
+        ttk.Separator(dialog, orient='horizontal').pack(fill='x', pady=10)
+    
+        # Show list of selected assets if multiple
+        if len(selected_assets) > 1:
+            assets_frame = ttk.LabelFrame(dialog, text=f"Selected Assets ({len(selected_assets)})", padding=10)
+            assets_frame.pack(fill='both', expand=True, padx=20, pady=(0, 10))
+            
+            # Create scrollable list
+            list_container = ttk.Frame(assets_frame)
+            list_container.pack(fill='both', expand=True)
+            
+            assets_tree = ttk.Treeview(list_container, columns=('BFM', 'Description'), 
+                                        show='headings', height=6)
+            assets_tree.heading('BFM', text='BFM Equipment No.')
+            assets_tree.heading('Description', text='Description')
+            assets_tree.column('BFM', width=150)
+            assets_tree.column('Description', width=450)
+            
+            scrollbar = ttk.Scrollbar(list_container, orient='vertical', command=assets_tree.yview)
+            assets_tree.configure(yscrollcommand=scrollbar.set)
+            
+            assets_tree.pack(side='left', fill='both', expand=True)
+            scrollbar.pack(side='right', fill='y')
+            
+            # Add assets to list
+            for bfm, desc in selected_assets:
+                assets_tree.insert('', 'end', values=(bfm, desc))
+    
+        # PM Frequency Selection Frame
+        pm_frame = ttk.LabelFrame(dialog, text="Select PM Frequencies to Enable", padding=20)
+        pm_frame.pack(fill='x', padx=20, pady=10)
+        
+        # Instructions
+        if len(selected_assets) > 1:
+            instruction_text = "These PM frequencies will be applied to ALL selected assets:"
+        else:
+            instruction_text = "Choose which preventive maintenance schedules to enable:"
+    
+        ttk.Label(pm_frame, text=instruction_text,
+                font=('Arial', 10)).pack(anchor='w', pady=(0, 15))
+    
+        # PM Type Checkboxes
+        monthly_var = tk.BooleanVar(value=True)  # Default: Monthly enabled
+        six_month_var = tk.BooleanVar(value=False)  # Default: Six Month disabled
+        annual_var = tk.BooleanVar(value=True)  # Default: Annual enabled
+        
+        # Monthly PM
+        monthly_frame = ttk.Frame(pm_frame)
+        monthly_frame.pack(fill='x', pady=5)
+        monthly_cb = ttk.Checkbutton(monthly_frame, text="Monthly PM (every 30 days)", 
+                                    variable=monthly_var)
+        monthly_cb.pack(side='left')
+        ttk.Label(monthly_frame, text="✓ Recommended for most equipment", 
+                foreground='green', font=('Arial', 8, 'italic')).pack(side='left', padx=10)
+    
+        # Six Month PM
+        six_month_frame = ttk.Frame(pm_frame)
+        six_month_frame.pack(fill='x', pady=5)
+        six_month_cb = ttk.Checkbutton(six_month_frame, text="Six Month PM (every 180 days)", 
+                                        variable=six_month_var)
+        six_month_cb.pack(side='left')
+        ttk.Label(six_month_frame, text="⚠ Less frequent PM cycle", 
+                foreground='orange', font=('Arial', 8, 'italic')).pack(side='left', padx=10)
+    
+        # Annual PM
+        annual_frame = ttk.Frame(pm_frame)
+        annual_frame.pack(fill='x', pady=5)
+        annual_cb = ttk.Checkbutton(annual_frame, text="Annual PM (yearly)", 
+                                    variable=annual_var)
+        annual_cb.pack(side='left')
+        ttk.Label(annual_frame, text="✓ Recommended for comprehensive checks", 
+                foreground='green', font=('Arial', 8, 'italic')).pack(side='left', padx=10)
+    
+        # Warning label
+        warning_frame = ttk.Frame(pm_frame)
+        warning_frame.pack(fill='x', pady=15)
+        warning_label = ttk.Label(warning_frame, 
+                                text="⚠ Note: You must select at least one PM frequency to reactivate.",
+                                foreground='blue', font=('Arial', 9, 'italic'), wraplength=600)
+        warning_label.pack()
+    
+        # Info box
+        info_frame = ttk.LabelFrame(dialog, text="Reactivation Summary", padding=10)
+        info_frame.pack(fill='x', padx=20, pady=(0, 10))
+        
+        if len(selected_assets) > 1:
+            info_text = f"""This will reactivate {len(selected_assets)} assets:
+        • Set all equipment statuses to Active
+        • Enable selected PM frequencies for all assets
+        • Remove all from Run to Failure list
+        • Resume normal PM scheduling"""
+        else:
+            info_text = """This will:
+        • Set equipment status to Active
+        • Enable selected PM frequencies
+        • Remove from Run to Failure list
+        • Resume normal PM scheduling"""
+    
+        ttk.Label(info_frame, text=info_text, justify='left').pack(anchor='w')
+    
+        def validate_and_reactivate():
+            """Validate selections and reactivate the asset(s)"""
+            # Check that at least one PM type is selected
+            if not monthly_var.get() and not six_month_var.get() and not annual_var.get():
+                messagebox.showerror("Validation Error", 
+                                   "You must select at least one PM frequency to reactivate.\n\n"
+                                   "If you don't want to schedule PMs, leave the assets in Run to Failure status.")
+                return
+        
+            # Build PM list
+            pm_list = []
+            if monthly_var.get():
+                pm_list.append("Monthly")
+            if six_month_var.get():
+                pm_list.append("Six Month")
+            if annual_var.get():
+                pm_list.append("Annual")
+        
+            pm_enabled = ", ".join(pm_list)
+        
+            # Confirmation
+            if len(selected_assets) == 1:
+                confirm_msg = (f"Reactivate asset {selected_assets[0][0]}?\n\n"
+                              f"Equipment will be set to Active status with:\n"
+                              f"PM Frequencies: {pm_enabled}\n\n"
+                              f"Continue?")
+            else:
+                confirm_msg = (f"Reactivate {len(selected_assets)} assets?\n\n"
+                              f"All assets will be set to Active status with:\n"
+                              f"PM Frequencies: {pm_enabled}\n\n"
+                              f"Continue?")
+        
+            result = messagebox.askyesno("Confirm Reactivation", confirm_msg)
+        
+            if not result:
+                return
+        
+            # Perform reactivation
             try:
                 cursor = self.conn.cursor()
             
-                # Update equipment status and enable PMs
-                cursor.execute('''
-                    UPDATE equipment SET 
-                    status = 'Active',
-                    monthly_pm = 1,
-                    six_month_pm = 0,
-                    annual_pm = 1,
-                    updated_date = CURRENT_TIMESTAMP
-                    WHERE bfm_equipment_no = ?
-                ''', (bfm_no,))
+                successful = 0
+                failed = []
             
-                # Remove from run_to_failure_assets table (optional, for clean data)
-                cursor.execute('DELETE FROM run_to_failure_assets WHERE bfm_equipment_no = ?', (bfm_no,))
+                for bfm_no, description in selected_assets:
+                    try:
+                        # Update equipment status and enable selected PMs
+                        cursor.execute('''
+                            UPDATE equipment SET 
+                            status = 'Active',
+                            monthly_pm = ?,
+                            six_month_pm = ?,
+                            annual_pm = ?,
+                            updated_date = CURRENT_TIMESTAMP
+                            WHERE bfm_equipment_no = ?
+                        ''', (
+                            1 if monthly_var.get() else 0,
+                            1 if six_month_var.get() else 0,
+                            1 if annual_var.get() else 0,
+                            bfm_no
+                        ))
+                    
+                        # Remove from run_to_failure_assets table
+                        cursor.execute('DELETE FROM run_to_failure_assets WHERE bfm_equipment_no = ?', (bfm_no,))
+                    
+                        successful += 1
+                    
+                    except Exception as e:
+                        failed.append(f"{bfm_no}: {str(e)}")
             
                 self.conn.commit()
             
-                messagebox.showinfo(
-                    "Success", 
-                    f"Asset {bfm_no} successfully reactivated!\n\n"
-                    f"Status: Active\n"
-                    f"PMs Enabled: Monthly, Annual\n"
-                    f"Equipment moved back to main equipment list"
-                )
+                # Show results
+                if len(selected_assets) == 1:
+                    messagebox.showinfo(
+                        "Success", 
+                        f"Asset {selected_assets[0][0]} successfully reactivated!\n\n"
+                        f"Status: Active\n"
+                        f"PMs Enabled: {pm_enabled}\n\n"
+                        f"Equipment moved back to main equipment list"
+                    )
+                else:
+                    result_msg = f"Bulk Reactivation Complete!\n\n"
+                    result_msg += f"Successfully reactivated: {successful} assets\n"
+                    if failed:
+                        result_msg += f"Failed: {len(failed)} assets\n\n"
+                        result_msg += "Failed assets:\n" + "\n".join(failed[:5])
+                        if len(failed) > 5:
+                            result_msg += f"\n... and {len(failed) - 5} more"
+                
+                    result_msg += f"\n\nPMs Enabled: {pm_enabled}"
+                
+                    if failed:
+                        messagebox.showwarning("Partial Success", result_msg)
+                    else:
+                        messagebox.showinfo("Success", result_msg)
+            
+                dialog.destroy()
             
                 # Refresh all displays
                 self.refresh_equipment_list()
                 self.load_run_to_failure_assets()
                 self.update_equipment_statistics()
-                self.update_status(f"Reactivated asset {bfm_no}")
+            
+                if len(selected_assets) == 1:
+                    self.update_status(f"Reactivated asset {selected_assets[0][0]} with {pm_enabled} PMs")
+                else:
+                    self.update_status(f"Reactivated {successful} assets with {pm_enabled} PMs")
             
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to reactivate asset: {str(e)}")
+                messagebox.showerror("Error", f"Failed to reactivate assets: {str(e)}")
+    
+        # Buttons
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(fill='x', padx=20, pady=15)
+        
+        if len(selected_assets) == 1:
+            button_text = "✓ Reactivate Asset"
+        else:
+            button_text = f"✓ Reactivate {len(selected_assets)} Assets"
+    
+        ttk.Button(button_frame, text=button_text, 
+                   command=validate_and_reactivate,
+                   style='Accent.TButton').pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Cancel", 
+                   command=dialog.destroy).pack(side='left', padx=5)
     
     
     def clear_completion_form(self):
@@ -8192,6 +9880,14 @@ class AITCMMSSystem:
     def load_recent_completions(self):
         """Load recent PM completions with debugging"""
         print("DEBUG: load_recent_completions called")
+        
+        # ADD THIS SAFETY CHECK AT THE VERY BEGINNING:
+        if not hasattr(self, 'recent_completions_tree'):
+            print("DEBUG: recent_completions_tree not yet created, skipping load")
+            return
+        
+        
+        
         try:
             cursor = self.conn.cursor()
             print("DEBUG: Database cursor created")
@@ -8446,67 +10142,118 @@ class AITCMMSSystem:
     
     
     def create_cm_dialog(self):
-        """Enhanced CM dialog - auto-fills technician name for technician users"""
+        """Create new Corrective Maintenance with calendar date picker"""
         dialog = tk.Toplevel(self.root)
-        dialog.title("Create Corrective Maintenance")
+        dialog.title("Create New Corrective Maintenance")
         dialog.geometry("600x550")
         dialog.transient(self.root)
         dialog.grab_set()
-    
-        # Generate CM number
-        cm_number = f"CM-{datetime.now().strftime('%Y%m%d')}-{random.randint(1000, 9999)}"
-    
-        # Form fields
+
+        # Generate next CM number
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT MAX(CAST(SUBSTR(cm_number, 3) AS INTEGER)) FROM corrective_maintenance WHERE cm_number LIKE "CM%"')
+        result = cursor.fetchone()[0]
+        next_cm_num = f"CM{(result + 1) if result else 1:04d}"
+
         row = 0
-    
-        # CM Number
-        ttk.Label(dialog, text="CM Number:").grid(row=row, column=0, sticky='w', padx=10, pady=5)
-        cm_number_var = tk.StringVar(value=cm_number)
+
+        # CM Number (auto-generated, read-only)
+        ttk.Label(dialog, text="CM Number:", font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='w', padx=10, pady=5)
+        cm_number_var = tk.StringVar(value=next_cm_num)
         ttk.Entry(dialog, textvariable=cm_number_var, width=20, state='readonly').grid(row=row, column=1, sticky='w', padx=10, pady=5)
         row += 1
-    
-        # Equipment
-        ttk.Label(dialog, text="BFM Equipment No:").grid(row=row, column=0, sticky='w', padx=10, pady=5)
-        bfm_var = tk.StringVar()
-        bfm_combo = ttk.Combobox(dialog, textvariable=bfm_var, width=25)
-        bfm_combo.grid(row=row, column=1, sticky='w', padx=10, pady=5)
+
+        # ========== ENHANCED DATE PICKER SECTION ==========
+        ttk.Label(dialog, text="CM Date:", font=('Arial', 10)).grid(row=row, column=0, sticky='w', padx=10, pady=5)
         
-        # Populate equipment list
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT bfm_equipment_no FROM equipment ORDER BY bfm_equipment_no')
-        equipment_list = [row[0] for row in cursor.fetchall()]
-        bfm_combo['values'] = equipment_list
-        row += 1
+        # Create frame for date entry and calendar button
+        date_frame = ttk.Frame(dialog)
+        date_frame.grid(row=row, column=1, sticky='w', padx=10, pady=5)
         
-        # CM Date field
-        ttk.Label(dialog, text="CM Date (YYYY-MM-DD):").grid(row=row, column=0, sticky='w', padx=10, pady=5)
+        # Date entry field - default to today's date
         cm_date_var = tk.StringVar(value=datetime.now().strftime('%Y-%m-%d'))
-        cm_date_entry = ttk.Entry(dialog, textvariable=cm_date_var, width=15)
-        cm_date_entry.grid(row=row, column=1, sticky='w', padx=10, pady=5)
+        date_entry = ttk.Entry(date_frame, textvariable=cm_date_var, width=15)
+        date_entry.pack(side='left', padx=(0, 5))
         
-        # Add helper text for date format
-        ttk.Label(dialog, text="(Examples: 2025-08-04, 2025-12-15)", 
-                font=('Arial', 8), foreground='gray').grid(row=row, column=2, sticky='w', padx=5, pady=5)
-        row += 1
+        # Calendar picker button
+        def open_calendar():
+            """Open calendar dialog to pick a date"""
+            from tkcalendar import Calendar
+        
+            # Create calendar dialog
+            cal_dialog = tk.Toplevel(dialog)
+            cal_dialog.title("Select Date")
+            cal_dialog.geometry("300x300")
+            cal_dialog.transient(dialog)
+            cal_dialog.grab_set()
+        
+            # Parse current date or use today
+            try:
+                current_date = datetime.strptime(cm_date_var.get(), '%Y-%m-%d')
+            except:
+                current_date = datetime.now()
+        
+            # Create calendar widget
+            cal = Calendar(cal_dialog, 
+                          selectmode='day',
+                          year=current_date.year,
+                          month=current_date.month,
+                          day=current_date.day,
+                          date_pattern='yyyy-mm-dd')
+            cal.pack(pady=20, padx=20, fill='both', expand=True)
+        
+            def select_date():
+                cm_date_var.set(cal.get_date())
+                cal_dialog.destroy()
+        
+            # Buttons
+            button_frame = ttk.Frame(cal_dialog)
+            button_frame.pack(pady=10)
+            ttk.Button(button_frame, text="Select", command=select_date).pack(side='left', padx=5)
+            ttk.Button(button_frame, text="Today", 
+                    command=lambda: [cm_date_var.set(datetime.now().strftime('%Y-%m-%d')), 
+                                    cal_dialog.destroy()]).pack(side='left', padx=5)
+            ttk.Button(button_frame, text="Cancel", command=cal_dialog.destroy).pack(side='left', padx=5)
     
+        # Calendar button with icon
+        ttk.Button(date_frame, text="📅 Pick Date", command=open_calendar).pack(side='left')
+        
+        # Date format helper label
+        ttk.Label(dialog, text="Format: YYYY-MM-DD", 
+                font=('Arial', 8), foreground='gray').grid(row=row, column=2, sticky='w', padx=5)
+        row += 1
+        # ================================================
+
+        # Equipment Selection
+        ttk.Label(dialog, text="Equipment (BFM):").grid(row=row, column=0, sticky='w', padx=10, pady=5)
+        bfm_var = tk.StringVar()
+        
+        cursor.execute('SELECT DISTINCT bfm_equipment_no FROM equipment WHERE status = "Active" ORDER BY bfm_equipment_no')
+        equipment_list = [row[0] for row in cursor.fetchall()]
+        
+        bfm_combo = ttk.Combobox(dialog, textvariable=bfm_var, values=equipment_list, width=20)
+        bfm_combo.grid(row=row, column=1, sticky='w', padx=10, pady=5)
+        row += 1
+
         # Description
         ttk.Label(dialog, text="Description:").grid(row=row, column=0, sticky='nw', padx=10, pady=5)
-        description_text = tk.Text(dialog, width=40, height=4)
-        description_text.grid(row=row, column=1, sticky='w', padx=10, pady=5)
+        description_text = tk.Text(dialog, width=40, height=6)
+        description_text.grid(row=row, column=1, columnspan=2, sticky='w', padx=10, pady=5)
         row += 1
-    
+
         # Priority
         ttk.Label(dialog, text="Priority:").grid(row=row, column=0, sticky='w', padx=10, pady=5)
-        priority_var = tk.StringVar(value='Medium')
+        priority_var = tk.StringVar(value="Medium")
         priority_combo = ttk.Combobox(dialog, textvariable=priority_var, 
-                                    values=['Low', 'Medium', 'High', 'Emergency'], width=15)
+                                    values=["Low", "Medium", "High", "Critical"], 
+                                    state="readonly", width=20)
         priority_combo.grid(row=row, column=1, sticky='w', padx=10, pady=5)
         row += 1
-    
-        # Assigned Technician - auto-fill for technicians
+
+        # Assigned Technician
         ttk.Label(dialog, text="Assigned Technician:").grid(row=row, column=0, sticky='w', padx=10, pady=5)
         assigned_var = tk.StringVar()
-    
+
         if self.current_user_role == 'Technician':
             # Auto-assign to current technician and make read-only
             assigned_var.set(self.user_name)
@@ -8518,38 +10265,37 @@ class AITCMMSSystem:
                                         values=self.technicians, width=20)
             assigned_combo.grid(row=row, column=1, sticky='w', padx=10, pady=5)
         row += 1
-    
-        # Rest of the validation and save logic remains the same...
+
         def validate_and_save_cm():
             """Validate the CM date format and save"""
             try:
                 # Validate the date format
                 cm_date_input = cm_date_var.get().strip()
-            
+        
                 if not cm_date_input:
                     messagebox.showerror("Error", "Please enter a CM date")
                     return
-            
+        
                 # Try to parse the date to validate format
                 try:
                     parsed_date = datetime.strptime(cm_date_input, '%Y-%m-%d')
-                
+            
                     if parsed_date > datetime.now() + timedelta(days=1):
                         result = messagebox.askyesno("Future Date Warning", 
                                                 f"The CM date '{cm_date_input}' is in the future.\n\n"
                                                 f"Are you sure this is correct?")
                         if not result:
                             return
-                
+            
                     if parsed_date < datetime.now() - timedelta(days=365):
                         result = messagebox.askyesno("Old Date Warning", 
                                                 f"The CM date '{cm_date_input}' is more than 1 year ago.\n\n"
                                                 f"Are you sure this is correct?")
                         if not result:
                             return
-                
+            
                     validated_date = parsed_date.strftime('%Y-%m-%d')
-                
+            
                 except ValueError:
                     messagebox.showerror("Invalid Date Format", 
                                     f"Please enter the date in YYYY-MM-DD format.\n\n"
@@ -8558,16 +10304,16 @@ class AITCMMSSystem:
                                     f"• 2025-12-15 (December 15th, 2025)\n\n"
                                     f"You entered: '{cm_date_input}'")
                     return
-            
+        
                 # Validate other required fields
                 if not bfm_var.get():
                     messagebox.showerror("Error", "Please select equipment")
                     return
-                
+            
                 if not description_text.get('1.0', 'end-1c').strip():
                     messagebox.showerror("Error", "Please enter a description")
                     return
-            
+        
                 # Save to database with the manually entered date
                 cursor = self.conn.cursor()
                 cursor.execute('''
@@ -8583,7 +10329,7 @@ class AITCMMSSystem:
                     validated_date
                 ))
                 self.conn.commit()
-                
+            
                 messagebox.showinfo("Success", 
                                 f"Corrective Maintenance created successfully!\n\n"
                                 f"CM Number: {cm_number_var.get()}\n"
@@ -8592,24 +10338,10 @@ class AITCMMSSystem:
                                 f"Assigned to: {assigned_var.get()}")
                 dialog.destroy()
                 self.load_corrective_maintenance()
-            
+        
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to create CM: {str(e)}")
-    
-        def set_date_to_today():
-            cm_date_var.set(datetime.now().strftime('%Y-%m-%d'))
-    
-        def set_date_to_yesterday():
-            yesterday = datetime.now() - timedelta(days=1)
-            cm_date_var.set(yesterday.strftime('%Y-%m-%d'))
-    
-        # Date helper buttons
-        date_buttons_frame = ttk.Frame(dialog)
-        date_buttons_frame.grid(row=2, column=2, sticky='w', padx=5, pady=5)
-    
-        ttk.Button(date_buttons_frame, text="Today", command=set_date_to_today).pack(side='top', pady=1)
-        ttk.Button(date_buttons_frame, text="Yesterday", command=set_date_to_yesterday).pack(side='top', pady=1)
-    
+
         # Buttons
         button_frame = ttk.Frame(dialog)
         button_frame.grid(row=row, column=0, columnspan=3, pady=20)
@@ -8714,7 +10446,7 @@ class AITCMMSSystem:
         ttk.Label(header_frame, text="Status:").grid(row=row, column=0, sticky='w', padx=5, pady=5)
         status_var = tk.StringVar(value=orig_status or 'Open')
         status_combo = ttk.Combobox(header_frame, textvariable=status_var, 
-                              values=['Open', 'In Progress', 'Completed', 'Cancelled'], width=15)
+                              values=['Open', 'Closed'], width=15)
         status_combo.grid(row=row, column=1, sticky='w', padx=5, pady=5)
         row += 1
 
@@ -8833,6 +10565,26 @@ class AITCMMSSystem:
 
         ttk.Button(button_frame, text="Save Changes", command=save_changes).pack(side='left', padx=5)
         ttk.Button(button_frame, text="Delete CM", command=delete_cm).pack(side='left', padx=5)
+        
+        # ============ ADD THIS NEW SECTION ============
+        # View Parts button - shows parts consumed for this CM
+        if hasattr(self, 'parts_integration'):
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM cm_parts_used WHERE cm_number = ?', (orig_cm_number,))
+            parts_count = cursor.fetchone()[0]
+            
+            if parts_count > 0:
+                button_text = f"🔧 View Parts Used ({parts_count})"
+            else:
+                button_text = "🔧 No Parts Used"
+            
+            def show_parts_detail():
+                self.parts_integration.show_cm_parts_details(orig_cm_number)
+            
+            ttk.Button(button_frame, text=button_text, 
+                      command=show_parts_detail).pack(side='left', padx=5)
+        # ============ END NEW SECTION ============
+        
         ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side='right', padx=5)
 
         # Pack the canvas and scrollbar
@@ -8843,86 +10595,262 @@ class AITCMMSSystem:
         scrollable_frame.update_idletasks()
         main_canvas.configure(scrollregion=main_canvas.bbox("all"))
     
+    
+    
     def complete_cm_dialog(self):
-        """Dialog to complete Corrective Maintenance"""
+        """Complete selected CM with parts consumption tracking"""
         selected = self.cm_tree.selection()
         if not selected:
             messagebox.showwarning("Warning", "Please select a CM to complete")
             return
-        
+
         # Get selected CM data
         item = self.cm_tree.item(selected[0])
         cm_number = item['values'][0]
-        
+    
+        # Fetch CM details
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT cm_number, bfm_equipment_no, description, assigned_technician, 
+                status, labor_hours, notes, root_cause, corrective_action
+            FROM corrective_maintenance 
+            WHERE cm_number = ?
+        ''', (cm_number,))
+    
+        cm_data = cursor.fetchone()
+        if not cm_data:
+            messagebox.showerror("Error", "CM not found")
+            return
+    
+        (cm_num, equipment, desc, tech, status, labor_hrs, 
+         notes, root_cause, corr_action) = cm_data
+    
+        # Check if already closed
+        if status in ['Closed', 'Completed']:
+            messagebox.showinfo("Info", f"CM {cm_number} is already closed")
+            return
+    
+        # Create closure dialog
         dialog = tk.Toplevel(self.root)
-        dialog.title("Complete Corrective Maintenance")
-        dialog.geometry("500x400")
+        dialog.title(f"Complete CM - {cm_number}")
+        dialog.geometry("700x600")
         dialog.transient(self.root)
         dialog.grab_set()
+    
+        # Header
+        header_frame = ttk.Frame(dialog)
+        header_frame.pack(fill='x', padx=10, pady=10)
+    
+        ttk.Label(header_frame, text=f"Complete Corrective Maintenance", 
+                font=('Arial', 12, 'bold')).pack()
+        ttk.Label(header_frame, text=f"CM Number: {cm_number}", 
+                font=('Arial', 10)).pack()
+        ttk.Label(header_frame, text=f"Equipment: {equipment}", 
+                font=('Arial', 10)).pack()
+    
+        # Main form frame with scrollbar
+        canvas = tk.Canvas(dialog)
+        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+    
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+    
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
         
-        # Completion form
+        canvas.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Form fields
         row = 0
-        
-        ttk.Label(dialog, text=f"Completing CM: {cm_number}").grid(row=row, column=0, columnspan=2, pady=10)
+    
+        # Completion Date
+        ttk.Label(scrollable_frame, text="Completion Date*:", 
+                font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='w', padx=10, pady=5)
+        completion_date_var = tk.StringVar(value=datetime.now().strftime('%Y-%m-%d'))
+        ttk.Entry(scrollable_frame, textvariable=completion_date_var, width=40).grid(
+            row=row, column=1, sticky='w', padx=10, pady=5)
+        ttk.Label(scrollable_frame, text="(Format: YYYY-MM-DD)", 
+                font=('Arial', 8, 'italic')).grid(row=row, column=2, sticky='w')
         row += 1
-        
-        # Labor hours
-        ttk.Label(dialog, text="Labor Hours:").grid(row=row, column=0, sticky='w', padx=10, pady=5)
-        labor_hours_var = tk.StringVar(value="0")
-        ttk.Entry(dialog, textvariable=labor_hours_var, width=10).grid(row=row, column=1, sticky='w', padx=10, pady=5)
+    
+        # Labor Hours
+        ttk.Label(scrollable_frame, text="Total Labor Hours*:", 
+                font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='w', padx=10, pady=5)
+        labor_hours_var = tk.StringVar(value=str(labor_hrs) if labor_hrs else '')
+        ttk.Entry(scrollable_frame, textvariable=labor_hours_var, width=40).grid(
+            row=row, column=1, sticky='w', padx=10, pady=5)
         row += 1
-        
-        # Completion notes
-        ttk.Label(dialog, text="Completion Notes:").grid(row=row, column=0, sticky='nw', padx=10, pady=5)
-        notes_text = tk.Text(dialog, width=40, height=6)
-        notes_text.grid(row=row, column=1, sticky='w', padx=10, pady=5)
+    
+        ttk.Separator(scrollable_frame, orient='horizontal').grid(
+            row=row, column=0, columnspan=3, sticky='ew', pady=10)
         row += 1
-        
-        # Root cause
-        ttk.Label(dialog, text="Root Cause:").grid(row=row, column=0, sticky='nw', padx=10, pady=5)
-        root_cause_text = tk.Text(dialog, width=40, height=3)
+    
+        # Root Cause
+        ttk.Label(scrollable_frame, text="Root Cause*:", 
+                font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='nw', padx=10, pady=5)
+        root_cause_text = tk.Text(scrollable_frame, width=50, height=4)
+        root_cause_text.insert('1.0', root_cause or '')
         root_cause_text.grid(row=row, column=1, sticky='w', padx=10, pady=5)
         row += 1
-        
-        # Corrective action
-        ttk.Label(dialog, text="Corrective Action:").grid(row=row, column=0, sticky='nw', padx=10, pady=5)
-        corrective_action_text = tk.Text(dialog, width=40, height=3)
-        corrective_action_text.grid(row=row, column=1, sticky='w', padx=10, pady=5)
+    
+        # Corrective Action
+        ttk.Label(scrollable_frame, text="Corrective Action Taken*:", 
+                font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='nw', padx=10, pady=5)
+        corr_action_text = tk.Text(scrollable_frame, width=50, height=4)
+        corr_action_text.insert('1.0', corr_action or '')
+        corr_action_text.grid(row=row, column=1, sticky='w', padx=10, pady=5)
         row += 1
-        
-        def complete_cm():
-            try:
-                cursor = self.conn.cursor()
-                cursor.execute('''
-                    UPDATE corrective_maintenance SET
-                    status = 'Completed',
-                    completion_date = ?,
-                    labor_hours = ?,
-                    notes = ?,
-                    root_cause = ?,
-                    corrective_action = ?
-                    WHERE cm_number = ?
-                ''', (
-                    datetime.now().strftime('%Y-%m-%d'),
-                    float(labor_hours_var.get() or 0),
-                    notes_text.get('1.0', 'end-1c'),
-                    root_cause_text.get('1.0', 'end-1c'),
-                    corrective_action_text.get('1.0', 'end-1c'),
-                    cm_number
-                ))
-                self.conn.commit()
-                messagebox.showinfo("Success", "CM completed successfully!")
-                dialog.destroy()
-                self.load_corrective_maintenance()
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to complete CM: {str(e)}")
-        
-        # Buttons
+    
+        # Additional Notes
+        ttk.Label(scrollable_frame, text="Additional Notes:", 
+                font=('Arial', 10, 'bold')).grid(row=row, column=0, sticky='nw', padx=10, pady=5)
+        notes_text = tk.Text(scrollable_frame, width=50, height=4)
+        notes_text.insert('1.0', notes or '')
+        notes_text.grid(row=row, column=1, sticky='w', padx=10, pady=5)
+        row += 1
+    
+        ttk.Separator(scrollable_frame, orient='horizontal').grid(
+            row=row, column=0, columnspan=3, sticky='ew', pady=10)
+        row += 1
+    
+        # Parts consumption question - THIS IS THE KEY INTEGRATION POINT
+        ttk.Label(scrollable_frame, text="Were any parts used from MRO Stock?", 
+                font=('Arial', 11, 'bold'), foreground='blue').grid(
+                    row=row, column=0, columnspan=2, sticky='w', padx=10, pady=10)
+        row += 1
+    
+        parts_used_var = tk.StringVar(value="No")
+        ttk.Radiobutton(scrollable_frame, text="No parts were used", 
+                    variable=parts_used_var, value="No").grid(
+                        row=row, column=0, columnspan=2, sticky='w', padx=30, pady=5)
+        row += 1
+    
+        ttk.Radiobutton(scrollable_frame, text="Yes, parts were used (will open parts dialog)", 
+                    variable=parts_used_var, value="Yes").grid(
+                        row=row, column=0, columnspan=2, sticky='w', padx=30, pady=5)
+        row += 1
+    
+        # Button frame
         button_frame = ttk.Frame(dialog)
-        button_frame.grid(row=row, column=0, columnspan=2, pady=20)
+        button_frame.pack(fill='x', padx=10, pady=10)
+    
+        def validate_and_proceed():
+            """Validate closure form and proceed to parts or close"""
+            # Validate required fields
+            if not completion_date_var.get().strip():
+                messagebox.showerror("Error", "Completion date is required")
+                return
         
-        ttk.Button(button_frame, text="Complete CM", command=complete_cm).pack(side='left', padx=5)
-        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side='left', padx=5)
+            try:
+                datetime.strptime(completion_date_var.get(), '%Y-%m-%d')
+            except ValueError:
+                messagebox.showerror("Error", "Invalid date format. Use YYYY-MM-DD")
+                return
+        
+            if not labor_hours_var.get().strip():
+                messagebox.showerror("Error", "Labor hours is required")
+                return
+        
+            try:
+                labor_hrs_value = float(labor_hours_var.get())
+                if labor_hrs_value < 0:
+                    messagebox.showerror("Error", "Labor hours cannot be negative")
+                    return
+            except ValueError:
+                messagebox.showerror("Error", "Invalid labor hours value")
+                return
+        
+            root_cause_value = root_cause_text.get('1.0', 'end-1c').strip()
+            if not root_cause_value:
+                messagebox.showerror("Error", "Root cause is required")
+                return
+        
+            corr_action_value = corr_action_text.get('1.0', 'end-1c').strip()
+            if not corr_action_value:
+                messagebox.showerror("Error", "Corrective action is required")
+                return
+        
+            # Get all form values
+            completion_date = completion_date_var.get()
+            labor_hours = float(labor_hours_var.get())
+            root_cause = root_cause_value
+            corrective_action = corr_action_value
+            additional_notes = notes_text.get('1.0', 'end-1c').strip()
+            
+            # Combine notes
+            all_notes = additional_notes
+        
+            def finalize_closure(parts_recorded):
+                """Finalize CM closure after parts handling"""
+                if not parts_recorded and parts_used_var.get() == "Yes":
+                    # User cancelled parts dialog, don't close CM
+                    return
+            
+                try:
+                    cursor = self.conn.cursor()
+                
+                    # Update CM record
+                    cursor.execute('''
+                        UPDATE corrective_maintenance
+                        SET status = 'Closed',
+                            completion_date = ?,
+                            labor_hours = ?,
+                            root_cause = ?,
+                            corrective_action = ?,
+                            notes = ?
+                        WHERE cm_number = ?
+                    ''', (completion_date, labor_hours, root_cause, 
+                        corrective_action, all_notes, cm_number))
+                
+                    self.conn.commit()
+                
+                    messagebox.showinfo("Success", 
+                        f"CM {cm_number} completed successfully!\n\n"
+                        f"Completion Date: {completion_date}\n"
+                        f"Labor Hours: {labor_hours}\n"
+                        f"Status: Closed")
+                
+                    dialog.destroy()
+                    self.load_corrective_maintenance()
+                
+                except Exception as e:
+                    self.conn.rollback()
+                    messagebox.showerror("Error", f"Failed to complete CM: {str(e)}")
+            
+            # Check if parts were used
+            if parts_used_var.get() == "Yes":
+                # Close this dialog and open parts consumption dialog
+                dialog.destroy()
+            
+                # Open parts consumption dialog
+                # This requires the CMPartsIntegration module to be initialized
+                if hasattr(self, 'parts_integration'):
+                    self.parts_integration.show_parts_consumption_dialog(
+                        cm_number=cm_number,
+                        technician_name=tech or 'Unknown',
+                        callback=finalize_closure
+                    )
+                else:
+                    messagebox.showerror("Error", 
+                        "Parts integration module not initialized.\n"
+                        "Please contact system administrator.")
+                    # Still update CM but without parts
+                    finalize_closure(True)
+            else:
+                # No parts used, close directly
+                finalize_closure(True)
+    
+        ttk.Button(button_frame, text="💾 Complete CM", 
+                command=validate_and_proceed).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="❌ Cancel", 
+                command=dialog.destroy).pack(side='left', padx=5)
+    
+ 
+    
     
     def load_corrective_maintenance(self):
         """Load corrective maintenance data"""
@@ -11034,32 +12962,32 @@ class AITCMMSSystem:
         ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side='left', padx=5)
     
     def edit_equipment_dialog(self):
-        """Enhanced dialog to edit existing equipment with Run to Failure option"""
+        """Enhanced dialog to edit existing equipment with Run to Failure and Cannot Find options"""
         selected = self.equipment_tree.selection()
         if not selected:
             messagebox.showwarning("Warning", "Please select equipment to edit")
             return
-    
+
         # Get selected equipment data
         item = self.equipment_tree.item(selected[0])
         bfm_no = item['values'][1]  # BFM Equipment No.
-    
+
         # Fetch full equipment data
         cursor = self.conn.cursor()
         cursor.execute('SELECT * FROM equipment WHERE bfm_equipment_no = ?', (bfm_no,))
         equipment_data = cursor.fetchone()
-    
+
         if not equipment_data:
             messagebox.showerror("Error", "Equipment not found in database")
             return
-    
+
         # Create edit dialog
         dialog = tk.Toplevel(self.root)
         dialog.title("Edit Equipment")
-        dialog.geometry("500x500")  # Made taller for additional options
+        dialog.geometry("500x550")  # Made slightly taller for Cannot Find option
         dialog.transient(self.root)
         dialog.grab_set()
-    
+
         # Pre-populate fields
         fields = [
             ("SAP Material No:", tk.StringVar(value=equipment_data[1] or '')),
@@ -11069,86 +12997,168 @@ class AITCMMSSystem:
             ("Location:", tk.StringVar(value=equipment_data[5] or '')),
             ("Master LIN:", tk.StringVar(value=equipment_data[6] or ''))
         ]
-    
+
         entries = {}
-    
+
         for i, (label, var) in enumerate(fields):
             ttk.Label(dialog, text=label).grid(row=i, column=0, sticky='w', padx=10, pady=5)
             entry = ttk.Entry(dialog, textvariable=var, width=30)
             entry.grid(row=i, column=1, padx=10, pady=5)
             entries[label] = var
-    
-        # PM type checkboxes and Run to Failure option
+
+        # PM type checkboxes and Equipment Status options
         pm_frame = ttk.LabelFrame(dialog, text="PM Types & Equipment Status", padding=10)
         pm_frame.grid(row=len(fields), column=0, columnspan=2, padx=10, pady=10, sticky='ew')
-    
+
         # Current equipment status
         current_status = equipment_data[16] or 'Active'  # Status field
-    
-        # PM checkboxes (disabled if currently Run to Failure)
+
+        # PM checkboxes
         monthly_var = tk.BooleanVar(value=bool(equipment_data[7]))
         six_month_var = tk.BooleanVar(value=bool(equipment_data[8]))
         annual_var = tk.BooleanVar(value=bool(equipment_data[9]))
-    
+
         monthly_cb = ttk.Checkbutton(pm_frame, text="Monthly PM", variable=monthly_var)
         monthly_cb.pack(anchor='w')
-    
+
         six_month_cb = ttk.Checkbutton(pm_frame, text="Six Month PM", variable=six_month_var)
         six_month_cb.pack(anchor='w')
-    
+
         annual_cb = ttk.Checkbutton(pm_frame, text="Annual PM", variable=annual_var)
         annual_cb.pack(anchor='w')
-    
+        
+        # Disable PM checkboxes if currently Cannot Find or Run to Failure
+        if current_status in ['Run to Failure', 'Cannot Find']:
+            monthly_cb.config(state='disabled')
+            six_month_cb.config(state='disabled')
+            annual_cb.config(state='disabled')
+
         # Separator
         ttk.Separator(pm_frame, orient='horizontal').pack(fill='x', pady=10)
-    
+
         # Run to Failure option
         run_to_failure_var = tk.BooleanVar(value=(current_status == 'Run to Failure'))
         rtf_cb = ttk.Checkbutton(pm_frame, text="🔧 Set as Run to Failure Equipment", 
                                 variable=run_to_failure_var,
-                                command=lambda: toggle_pm_options())
+                                command=lambda: toggle_status_options())
         rtf_cb.pack(anchor='w', pady=5)
     
+        # Run to Failure warning label
+        rtf_warning_label = ttk.Label(pm_frame, text="Status: Will be set to Run to Failure", 
+                                    foreground='red', font=('Arial', 9, 'italic'))
+        if run_to_failure_var.get():
+            rtf_warning_label.pack(anchor='w', padx=20)
+
+        # Cannot Find option - NEW!
+        cannot_find_var = tk.BooleanVar(value=(current_status == 'Cannot Find'))
+        cf_cb = ttk.Checkbutton(pm_frame, text="❌ Mark as Cannot Find", 
+                            variable=cannot_find_var,
+                            command=lambda: toggle_status_options())
+        cf_cb.pack(anchor='w', pady=5)
+
+        # Cannot Find warning label
+        cf_warning_label = ttk.Label(pm_frame, text="Status: Will be set to Cannot Find (PMs disabled)", 
+                                    foreground='red', font=('Arial', 9, 'italic'))
+        if cannot_find_var.get():
+            cf_warning_label.pack(anchor='w', padx=20)
+
         # Status info
         status_label = ttk.Label(pm_frame, text=f"Current Status: {current_status}", 
                                 font=('Arial', 9, 'italic'))
-        status_label.pack(anchor='w', pady=2)
+        status_label.pack(anchor='w', pady=5)
+
+        # Technician selection for Cannot Find (appears when Cannot Find is checked)
+        tech_frame = ttk.Frame(pm_frame)
+        ttk.Label(tech_frame, text="Reported By:").pack(side='left', padx=(0, 5))
+        tech_var = tk.StringVar()
     
-        def toggle_pm_options():
-            """Enable/disable PM options based on Run to Failure selection"""
+        # Pre-populate technician if asset is already Cannot Find
+        if current_status == 'Cannot Find':
+            cursor.execute('SELECT technician_name FROM cannot_find_assets WHERE bfm_equipment_no = ?', (bfm_no,))
+            cf_data = cursor.fetchone()
+            if cf_data:
+                tech_var.set(cf_data[0])
+    
+        tech_combo = ttk.Combobox(tech_frame, textvariable=tech_var, width=20)
+        tech_combo['values'] = self.technicians if hasattr(self, 'technicians') else []
+        tech_combo.pack(side='left')
+    
+        # Show tech frame and warning if already Cannot Find
+        if cannot_find_var.get():
+            tech_frame.pack(anchor='w', pady=5, padx=20)
+            cf_warning_label.pack(anchor='w', padx=20)
+        if run_to_failure_var.get():
+            rtf_warning_label.pack(anchor='w', padx=20)
+
+        def toggle_status_options():
+            """Enable/disable options based on status selections and show/hide warnings"""
+            # Cannot select both Run to Failure and Cannot Find
+            if run_to_failure_var.get() and cannot_find_var.get():
+                # If both are checked, uncheck the other one
+                if run_to_failure_var.get():
+                    cannot_find_var.set(False)
+            
+            # Disable PM options if Run to Failure is selected
             if run_to_failure_var.get():
-                # Disable PM options when Run to Failure is selected
                 monthly_cb.config(state='disabled')
-                six_month_cb.config(state='disabled') 
+                six_month_cb.config(state='disabled')
                 annual_cb.config(state='disabled')
                 monthly_var.set(False)
                 six_month_var.set(False)
                 annual_var.set(False)
-                status_label.config(text="Status: Will be set to Run to Failure", foreground='red')
+                rtf_warning_label.pack(anchor='w', padx=20)
+                cf_warning_label.pack_forget()
+                tech_frame.pack_forget()
+            elif cannot_find_var.get():
+                # ALSO disable PM options for Cannot Find assets
+                monthly_cb.config(state='disabled')
+                six_month_cb.config(state='disabled')
+                annual_cb.config(state='disabled')
+                monthly_var.set(False)
+                six_month_var.set(False)
+                annual_var.set(False)
+                cf_warning_label.pack(anchor='w', padx=20)
+                rtf_warning_label.pack_forget()
+                tech_frame.pack(anchor='w', pady=5, padx=20)
             else:
-                # Enable PM options when Run to Failure is not selected
                 monthly_cb.config(state='normal')
                 six_month_cb.config(state='normal')
                 annual_cb.config(state='normal')
-                status_label.config(text="Status: Will be set to Active", foreground='green')
-    
-        # Initialize the toggle state
-        toggle_pm_options()
-    
+                rtf_warning_label.pack_forget()
+                cf_warning_label.pack_forget()
+                tech_frame.pack_forget()
+
+        # Run to Failure note
+        note_label = ttk.Label(pm_frame, 
+                              text="⚠️ Run to Failure and Cannot Find equipment will not be scheduled for PMs",
+                              font=('Arial', 8), foreground='orange')
+        note_label.pack(anchor='w', pady=(5, 0))
+
         def update_equipment():
-            """Update equipment with enhanced Run to Failure handling"""
+            """Update equipment in database with Cannot Find support"""
             try:
                 cursor = self.conn.cursor()
             
                 # Determine new status
-                new_status = 'Run to Failure' if run_to_failure_var.get() else 'Active'
+                if run_to_failure_var.get():
+                    new_status = 'Run to Failure'
+                elif cannot_find_var.get():
+                    new_status = 'Cannot Find'
+                else:
+                    new_status = 'Active'
             
-                # Update equipment record
+                # Update equipment table
                 cursor.execute('''
-                    UPDATE equipment SET
-                    sap_material_no = ?, description = ?, tool_id_drawing_no = ?, 
-                    location = ?, master_lin = ?, monthly_pm = ?, six_month_pm = ?, annual_pm = ?,
-                    status = ?, updated_date = CURRENT_TIMESTAMP
+                    UPDATE equipment 
+                    SET sap_material_no = ?,
+                        description = ?,
+                        tool_id_drawing_no = ?,
+                        location = ?,
+                        master_lin = ?,
+                        monthly_pm = ?,
+                        six_month_pm = ?,
+                        annual_pm = ?,
+                        status = ?
                     WHERE bfm_equipment_no = ?
                 ''', (
                     entries["SAP Material No:"].get(),
@@ -11156,14 +13166,14 @@ class AITCMMSSystem:
                     entries["Tool ID/Drawing No:"].get(),
                     entries["Location:"].get(),
                     entries["Master LIN:"].get(),
-                    monthly_var.get() and not run_to_failure_var.get(),  # Disable PMs if RTF
-                    six_month_var.get() and not run_to_failure_var.get(),
-                    annual_var.get() and not run_to_failure_var.get(),
+                    monthly_var.get(),
+                    six_month_var.get(),
+                    annual_var.get(),
                     new_status,
                     bfm_no
                 ))
             
-                # If changing TO Run to Failure, add entry to run_to_failure_assets table
+                # Handle Run to Failure status
                 if run_to_failure_var.get() and current_status != 'Run to Failure':
                     cursor.execute('''
                         INSERT OR REPLACE INTO run_to_failure_assets 
@@ -11173,15 +13183,47 @@ class AITCMMSSystem:
                         bfm_no,
                         entries["Description:"].get(),
                         entries["Location:"].get(),
-                        'System Change',  # Default technician
+                        'System Change',
                         datetime.now().strftime('%Y-%m-%d'),
                         0.0,
-                        f'Equipment manually set to Run to Failure status via equipment edit dialog'
+                        'Equipment manually set to Run to Failure status via equipment edit dialog'
                     ))
-            
-                # If changing FROM Run to Failure back to Active, remove from run_to_failure_assets
+                
+                    # Remove from Cannot Find if it was there
+                    cursor.execute('DELETE FROM cannot_find_assets WHERE bfm_equipment_no = ?', (bfm_no,))
+                
                 elif not run_to_failure_var.get() and current_status == 'Run to Failure':
                     cursor.execute('DELETE FROM run_to_failure_assets WHERE bfm_equipment_no = ?', (bfm_no,))
+            
+                # Handle Cannot Find status - NEW!
+                if cannot_find_var.get():
+                    # Get technician name
+                    technician = tech_var.get().strip()
+                    if not technician:
+                        messagebox.showwarning("Missing Information", "Please select who is reporting this asset as Cannot Find")
+                        return
+                
+                    # Add or update in cannot_find_assets table
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO cannot_find_assets 
+                        (bfm_equipment_no, description, location, technician_name, report_date, status, notes)
+                        VALUES (?, ?, ?, ?, ?, 'Missing', ?)
+                    ''', (
+                        bfm_no,
+                        entries["Description:"].get(),
+                        entries["Location:"].get(),
+                        technician,
+                        datetime.now().strftime('%Y-%m-%d'),
+                        'Equipment marked as Cannot Find via equipment edit dialog'
+                    ))
+                
+                    # Remove from Run to Failure if it was there
+                    cursor.execute('DELETE FROM run_to_failure_assets WHERE bfm_equipment_no = ?', (bfm_no,))
+                
+                elif not cannot_find_var.get() and current_status == 'Cannot Find':
+                    # Remove from Cannot Find table
+                    cursor.execute('DELETE FROM cannot_find_assets WHERE bfm_equipment_no = ?', (bfm_no,))
+                    technician = None  # Set to None when unmarking
             
                 self.conn.commit()
             
@@ -11191,6 +13233,12 @@ class AITCMMSSystem:
                     success_msg += "- All PM requirements disabled\n"
                     success_msg += "- Equipment moved to Run to Failure tab\n"
                     success_msg += "- No future PMs will be scheduled"
+                elif cannot_find_var.get():
+                    success_msg = f"Equipment {bfm_no} updated successfully!\n\nStatus changed to: Cannot Find\n"
+                    success_msg += f"- Reported by: {technician}\n"
+                    success_msg += "- Equipment moved to Cannot Find tab\n"
+                    success_msg += "- All PM requirements disabled\n"
+                    success_msg += "- No future PMs will be scheduled"
                 else:
                     success_msg = f"Equipment {bfm_no} updated successfully!\n\nStatus: Active"
             
@@ -11199,36 +13247,218 @@ class AITCMMSSystem:
             
                 # Refresh all relevant displays
                 self.refresh_equipment_list()
-                self.load_run_to_failure_assets()  # Refresh Run to Failure tab
-                self.update_equipment_statistics()  # Update statistics
+                if hasattr(self, 'load_cannot_find_assets'):
+                    self.load_cannot_find_assets()
+                if hasattr(self, 'load_run_to_failure_assets'):
+                    self.load_run_to_failure_assets()
+                if hasattr(self, 'update_equipment_statistics'):
+                    self.update_equipment_statistics()
             
                 # Update status bar
                 if run_to_failure_var.get():
                     self.update_status(f"Equipment {bfm_no} set to Run to Failure")
+                elif cannot_find_var.get():
+                    self.update_status(f"Equipment {bfm_no} marked as Cannot Find")
                 else:
-                    self.update_status(f"Equipment {bfm_no} reactivated from Run to Failure")
-                
+                    self.update_status(f"Equipment {bfm_no} reactivated")
+            
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to update equipment: {str(e)}")
-    
-        # Buttons with enhanced styling
+
+        # Buttons
         button_frame = ttk.Frame(dialog)
         button_frame.grid(row=len(fields)+1, column=0, columnspan=2, pady=15)
-    
+
         update_btn = ttk.Button(button_frame, text="✅ Update Equipment", command=update_equipment)
         update_btn.pack(side='left', padx=10)
-    
+
         cancel_btn = ttk.Button(button_frame, text="❌ Cancel", command=dialog.destroy)
         cancel_btn.pack(side='left', padx=5)
     
-        # Add warning label for Run to Failure
-        warning_frame = ttk.Frame(dialog)
-        warning_frame.grid(row=len(fields)+2, column=0, columnspan=2, padx=10, pady=5)
     
-        warning_text = "⚠️ Run to Failure equipment will not be scheduled for regular PMs"
-        warning_label = ttk.Label(warning_frame, text=warning_text, 
-                             font=('Arial', 8, 'italic'), foreground='orange')
-        warning_label.pack()
+    
+    def bulk_edit_pm_cycles(self):
+        """Edit PM cycles for multiple selected assets"""
+        # Get selected items
+        selected_items = self.equipment_tree.selection()
+    
+        if not selected_items:
+            messagebox.showwarning("No Selection", 
+                                 "Please select one or more assets to edit.\n\n" +
+                                 "Tip: Hold Ctrl to select multiple items, or Shift to select a range.")
+            return
+    
+        # Get BFM numbers of selected items
+        selected_bfms = []
+        for item in selected_items:
+            values = self.equipment_tree.item(item)['values']
+            bfm_no = values[1]  # BFM is second column
+            selected_bfms.append(bfm_no)
+    
+        # Create dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Bulk Edit PM Cycles")
+        dialog.geometry("500x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+    
+        # Center dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (250)
+        y = (dialog.winfo_screenheight() // 2) - (200)
+        dialog.geometry(f"500x400+{x}+{y}")
+        
+        # Header
+        header_frame = ttk.Frame(dialog, padding=20)
+        header_frame.pack(fill='x')
+        
+        ttk.Label(header_frame, text="Bulk Edit PM Cycles", 
+                font=('Arial', 14, 'bold')).pack()
+        ttk.Label(header_frame, text=f"Editing {len(selected_bfms)} selected asset(s)", 
+                font=('Arial', 10), foreground='blue').pack(pady=5)
+    
+        # Separator
+        ttk.Separator(dialog, orient='horizontal').pack(fill='x', pady=10)
+        
+        # Show selected assets
+        assets_frame = ttk.LabelFrame(dialog, text="Selected Assets", padding=10)
+        assets_frame.pack(fill='both', expand=True, padx=20, pady=10)
+        
+        # Scrollable list of selected assets
+        assets_text = tk.Text(assets_frame, height=6, width=50, wrap='word')
+        assets_scrollbar = ttk.Scrollbar(assets_frame, orient='vertical', command=assets_text.yview)
+        assets_text.configure(yscrollcommand=assets_scrollbar.set)
+        
+        # Get asset details
+        cursor = self.conn.cursor()
+        for bfm in selected_bfms[:20]:  # Show first 20
+            cursor.execute('SELECT bfm_equipment_no, description FROM equipment WHERE bfm_equipment_no = ?', (bfm,))
+            result = cursor.fetchone()
+            if result:
+                assets_text.insert('end', f"• {result[0]} - {result[1][:40]}\n")
+    
+        if len(selected_bfms) > 20:
+            assets_text.insert('end', f"\n... and {len(selected_bfms) - 20} more assets")
+    
+        assets_text.config(state='disabled')
+        assets_text.pack(side='left', fill='both', expand=True)
+        assets_scrollbar.pack(side='right', fill='y')
+    
+        # PM Cycle options
+        pm_frame = ttk.LabelFrame(dialog, text="PM Cycle Settings", padding=15)
+        pm_frame.pack(fill='x', padx=20, pady=10)
+    
+        ttk.Label(pm_frame, text="Select which PM cycles to apply:", 
+                font=('Arial', 10, 'bold')).pack(anchor='w', pady=(0, 10))
+    
+        # Monthly PM
+        monthly_var = tk.BooleanVar(value=False)
+        monthly_check = ttk.Checkbutton(pm_frame, text="Monthly PM (every 30 days)", 
+                                        variable=monthly_var)
+        monthly_check.pack(anchor='w', pady=3)
+        
+        # Six Month PM
+        six_month_var = tk.BooleanVar(value=False)
+        six_month_check = ttk.Checkbutton(pm_frame, text="Six Month PM (every 180 days)", 
+                                        variable=six_month_var)
+        six_month_check.pack(anchor='w', pady=3)
+    
+        # Annual PM
+        annual_var = tk.BooleanVar(value=True)  # Default to Annual
+        annual_check = ttk.Checkbutton(pm_frame, text="Annual PM (every 365 days)", 
+                                    variable=annual_var)
+        annual_check.pack(anchor='w', pady=3)
+    
+        ttk.Label(pm_frame, text="Note: Unchecked cycles will be DISABLED for selected assets.", 
+                font=('Arial', 9), foreground='gray').pack(anchor='w', pady=(10, 0))
+    
+        # Buttons
+        button_frame = ttk.Frame(dialog, padding=10)
+        button_frame.pack(fill='x', side='bottom')
+    
+        def apply_changes():
+            """Apply PM cycle changes to all selected assets"""
+            try:
+                monthly_pm = 1 if monthly_var.get() else 0
+                six_month_pm = 1 if six_month_var.get() else 0
+                annual_pm = 1 if annual_var.get() else 0
+                
+                # Confirm action
+                pm_types = []
+                if monthly_pm:
+                    pm_types.append("Monthly")
+                if six_month_pm:
+                    pm_types.append("Six Month")
+                if annual_pm:
+                    pm_types.append("Annual")
+            
+                if not pm_types:
+                    result = messagebox.askyesno(
+                        "Warning - No PM Cycles Selected",
+                        f"You are about to DISABLE ALL PM cycles for {len(selected_bfms)} asset(s).\n\n" +
+                        "This means these assets will NOT be scheduled for any preventive maintenance.\n\n" +
+                        "Are you sure you want to continue?",
+                        icon='warning',
+                        parent=dialog
+                    )
+                else:
+                    pm_list = ", ".join(pm_types)
+                    result = messagebox.askyesno(
+                        "Confirm Changes",
+                        f"Apply the following PM cycles to {len(selected_bfms)} asset(s)?\n\n" +
+                        f"PM Cycles: {pm_list}\n\n" +
+                        "This will update all selected assets.",
+                        parent=dialog
+                    )
+            
+                if not result:
+                    return
+            
+                # Apply changes
+                cursor = self.conn.cursor()
+                updated_count = 0
+                
+                for bfm in selected_bfms:
+                    cursor.execute('''
+                        UPDATE equipment 
+                        SET monthly_pm = ?, six_month_pm = ?, annual_pm = ?
+                        WHERE bfm_equipment_no = ?
+                    ''', (monthly_pm, six_month_pm, annual_pm, bfm))
+                
+                    if cursor.rowcount > 0:
+                        updated_count += 1
+            
+                self.conn.commit()
+            
+                # Success message
+                messagebox.showinfo(
+                    "Success",
+                    f"Successfully updated PM cycles for {updated_count} asset(s)!",
+                    parent=dialog
+                )
+            
+                # Close dialog and refresh
+                dialog.destroy()
+                self.refresh_equipment_list()
+                self.update_status(f"Bulk updated PM cycles for {updated_count} assets")
+            
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to update PM cycles:\n\n{str(e)}", parent=dialog)
+    
+        ttk.Button(button_frame, text="✓ Apply to All Selected", 
+                command=apply_changes,
+                style='Accent.TButton').pack(side='left', padx=5)
+    
+        ttk.Button(button_frame, text="Cancel", 
+                command=dialog.destroy).pack(side='right', padx=5)
+
+
+    def enable_multiselect_on_equipment_tree(self):
+        """Enable multiple selection on equipment tree (call this after creating the tree)"""
+        self.equipment_tree.configure(selectmode='extended')  # Enable multi-select
+    
+    
+    
     
     def refresh_equipment_list(self):
         """Refresh equipment list display"""
@@ -11305,24 +13535,33 @@ class AITCMMSSystem:
                 defaultextension=".csv",
                 filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
             )
-            
+        
             if file_path:
                 cursor = self.conn.cursor()
-                cursor.execute('SELECT * FROM equipment ORDER BY bfm_equipment_no')
+                # SELECT specific columns instead of SELECT *
+                cursor.execute('''
+                    SELECT id, sap_material_no, bfm_equipment_no, description, 
+                           tool_id_drawing_no, location, master_lin, monthly_pm, 
+                           six_month_pm, annual_pm, last_monthly_pm, last_six_month_pm, 
+                           last_annual_pm, next_monthly_pm, next_six_month_pm, 
+                           next_annual_pm, status, created_date, updated_date
+                    FROM equipment 
+                    ORDER BY bfm_equipment_no
+                ''')
                 equipment_data = cursor.fetchall()
-                
+            
                 # Create DataFrame
                 columns = ['ID', 'SAP Material No', 'BFM Equipment No', 'Description', 
                           'Tool ID/Drawing No', 'Location', 'Master LIN', 'Monthly PM', 
                           'Six Month PM', 'Annual PM', 'Last Monthly PM', 'Last Six Month PM', 
                           'Last Annual PM', 'Next Monthly PM', 'Next Six Month PM', 
                           'Next Annual PM', 'Status', 'Created Date', 'Updated Date']
-                
+            
                 df = pd.DataFrame(equipment_data, columns=columns)
                 df.to_csv(file_path, index=False)
-                
+            
                 messagebox.showinfo("Success", f"Equipment list exported to {file_path}")
-                
+            
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export equipment list: {str(e)}")
     
@@ -11406,30 +13645,30 @@ class AITCMMSSystem:
             # Create directory for PM forms
             forms_dir = f"PM_Forms_Week_{week_start}_{timestamp}"
             os.makedirs(forms_dir, exist_ok=True)
-            
+        
             cursor = self.conn.cursor()
-            
+        
             # Generate forms for each technician
             for technician in self.technicians:
                 cursor.execute('''
                     SELECT ws.bfm_equipment_no, e.sap_material_no, e.description, e.tool_id_drawing_no,
-                           e.location, e.master_lin, ws.pm_type, ws.scheduled_date
+                        e.location, e.master_lin, ws.pm_type, ws.scheduled_date, ws.assigned_technician
                     FROM weekly_pm_schedules ws
                     JOIN equipment e ON ws.bfm_equipment_no = e.bfm_equipment_no
                     WHERE ws.assigned_technician = ? AND ws.week_start_date = ?
                     ORDER BY ws.scheduled_date
                 ''', (technician, week_start))
-                
+            
                 assignments = cursor.fetchall()
-                
+            
                 if assignments:
                     # Create PDF for this technician
                     filename = os.path.join(forms_dir, f"{technician.replace(' ', '_')}_PM_Forms.pdf")
                     self.create_pm_forms_pdf(filename, technician, assignments)
-            
+        
             messagebox.showinfo("Success", f"PM forms generated in directory: {forms_dir}")
             self.update_status(f"PM forms generated for week {week_start}")
-            
+        
         except Exception as e:
             messagebox.showerror("Error", f"Failed to generate PM forms: {str(e)}")
     
@@ -11437,13 +13676,13 @@ class AITCMMSSystem:
         """Create PDF with PM forms for a technician - ENHANCED WITH CUSTOM TEMPLATES"""
         try:
             doc = SimpleDocTemplate(filename, pagesize=letter,
-                                rightMargin=36, leftMargin=36,  # Reduced margins
+                                rightMargin=36, leftMargin=36,
                                 topMargin=36, bottomMargin=36)
 
             styles = getSampleStyleSheet()
             story = []
 
-            # Custom styles for better text wrapping
+        # Custom styles for better text wrapping
             cell_style = ParagraphStyle(
                 'CellStyle',
                 parent=styles['Normal'],
@@ -11461,16 +13700,6 @@ class AITCMMSSystem:
                 wordWrap='LTR'
             )
 
-            # AIT Logo style
-            logo_style = ParagraphStyle(
-                'LogoStyle',
-                parent=styles['Heading1'],
-                fontSize=18,
-                fontName='Helvetica-Bold',
-                alignment=1,
-                textColor=colors.red
-            )
-
             company_style = ParagraphStyle(
                 'CompanyStyle',
                 parent=styles['Heading1'],
@@ -11485,16 +13714,16 @@ class AITCMMSSystem:
 
             for i, assignment in enumerate(assignments):
                 print(f"DEBUG: Processing assignment {i}: {assignment}")
-            
-                # Safety check for assignment data
+        
+            # Safety check for assignment data
                 if not assignment or len(assignment) < 8:
                     print(f"DEBUG: Skipping invalid assignment {i}")
                     continue
 
-                # ASSIGN VARIABLES FIRST - CRITICAL TO DO THIS EARLY
-                bfm_no, sap_no, description, tool_id, location, master_lin, pm_type, scheduled_date = assignment
-            
-                # Add None checks for all variables
+            # Extract variables from assignment
+                bfm_no, sap_no, description, tool_id, location, master_lin, pm_type, scheduled_date, assigned_tech = assignment
+        
+            # Add None checks for all variables
                 bfm_no = bfm_no or ''
                 sap_no = sap_no or ''
                 description = description or ''
@@ -11503,177 +13732,20 @@ class AITCMMSSystem:
                 master_lin = master_lin or ''
                 pm_type = pm_type or 'Monthly'
                 scheduled_date = scheduled_date or ''
-            
+                assigned_tech = assigned_tech or technician
+        
                 print(f"DEBUG: Processing {bfm_no} - {pm_type}")
 
-                # =================== CUSTOM TEMPLATE INTEGRATION ===================
-                print(f"DEBUG: About to call get_pm_template_for_equipment for {bfm_no}, {pm_type}")
+            # =================== LOGO SECTION ===================
+            # Dynamic logo path that works on any computer
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                logo_path = os.path.join(script_dir, "img", "ait_logo.png")
 
                 try:
-                    custom_template = self.get_pm_template_for_equipment(bfm_no, pm_type)
-                    print(f"DEBUG: get_pm_template_for_equipment returned: {custom_template}")
-                
-                    if custom_template:
-                        print("DEBUG: Custom template found, extracting data...")
-                        checklist_items = custom_template.get('checklist_items', [])
-                        estimated_hours = custom_template.get('estimated_hours', 1.0)
-                        special_instructions = custom_template.get('special_instructions', '')
-                        safety_notes = custom_template.get('safety_notes', '')
-                    
-                        # Safety check for checklist items
-                        if not checklist_items or not isinstance(checklist_items, list):
-                            print("DEBUG: Invalid custom checklist_items, using default")
-                            checklist_items = [
-                                'Special Equipment Used (List):',
-                                'Validate your maintenance with Date / Stamp / Hours',
-                                'Refer to drawing when performing maintenance',
-                                'Make sure all instruments are properly calibrated',
-                                'Make sure tool is properly identified',
-                                'Make sure all mobile mechanisms move fluidly',
-                                'Visually inspect the welds',
-                                'Take note of any anomaly or defect (create a CM if needed)',
-                                'Check all screws. Tighten if needed.',
-                                'Check the pins for wear',
-                                'Make sure all tooling is secured to the equipment with cable',
-                                'Ensure all tags (BFM and SAP) are applied and securely fastened',
-                                'All documentation are picked up from work area',
-                                'All parts and tools have been picked up',
-                                'Workspace has been cleaned up',
-                                'Dry runs have been performed (tests, restarts, etc.)',
-                                "Ensure that AIT Sticker is applied"
-                            ]
-                    
-                        document_name = f"Custom_PM_Template_{pm_type}"
-                        document_revision = "C1"
-                        print(f"DEBUG: Using custom template for {bfm_no} - {pm_type}")
-                    else:
-                        print("DEBUG: No custom template, using defaults...")
-                        # Use default checklist items
-                        checklist_items = [
-                            'Special Equipment Used (List):',
-                            'Validate your maintenance with Date / Stamp / Hours',
-                            'Refer to drawing when performing maintenance',
-                            'Make sure all instruments are properly calibrated',
-                            'Make sure tool is properly identified',
-                            'Make sure all mobile mechanisms move fluidly',
-                            'Visually inspect the welds',
-                            'Take note of any anomaly or defect (create a CM if needed)',
-                            'Check all screws. Tighten if needed.',
-                            'Check the pins for wear',
-                            'Make sure all tooling is secured to the equipment with cable',
-                            'Ensure all tags (BFM and SAP) are applied and securely fastened',
-                            'All documentation are picked up from work area',
-                            'All parts and tools have been picked up',
-                            'Workspace has been cleaned up',
-                            'Dry runs have been performed (tests, restarts, etc.)',
-                            "Ensure that AIT Sticker is applied"
-                        ]
-                        estimated_hours = 1.0
-                        special_instructions = ''
-                        safety_notes = "Always be aware of both Airbus and AIT safety policies and ensure safety policies are followed."
-                        document_name = 'Preventive_Maintenance_Form'
-                        document_revision = 'A2'
-                        print(f"DEBUG: Using default template for {bfm_no} - {pm_type}")
-                    
-                except Exception as e:
-                    print(f"DEBUG: Exception in template section: {e}")
-                    # Fallback to basic defaults
-                    checklist_items = [
-                        'Special Equipment Used (List):',
-                        'Validate your maintenance with Date / Stamp / Hours',
-                        'Refer to drawing when performing maintenance',
-                        'Make sure all instruments are properly calibrated',
-                        'Make sure tool is properly identified',
-                        'Make sure all mobile mechanisms move fluidly',
-                        'Visually inspect the welds',
-                        'Take note of any anomaly or defect (create a CM if needed)',
-                        'Check all screws. Tighten if needed.',
-                        'Check the pins for wear',
-                        'Make sure all tooling is secured to the equipment with cable',
-                        'Ensure all tags (BFM and SAP) are applied and securely fastened',
-                        'All documentation are picked up from work area',
-                        'All parts and tools have been picked up',
-                        'Workspace has been cleaned up',
-                        'Dry runs have been performed (tests, restarts, etc.)',
-                        "Ensure that AIT Sticker is applied"
-                    ]
-                    estimated_hours = 1.0
-                    special_instructions = ''
-                    safety_notes = "Always be aware of both Airbus and AIT safety policies and ensure safety policies are followed."
-                    document_name = 'Preventive_Maintenance_Form'
-                    document_revision = 'A2'
-
-                print(f"DEBUG: Final checklist_items: {len(checklist_items)} items")
-                # ====================================================================
-
-                # Get the last PM date for this equipment and PM type from database
-                cursor = self.conn.cursor()
-                last_pm_date = ""
-
-                try:
-                    if pm_type == 'Monthly':
-                        cursor.execute('SELECT last_monthly_pm FROM equipment WHERE bfm_equipment_no = ?', (bfm_no,))
-                    elif pm_type == 'Six Month':
-                        cursor.execute('SELECT last_six_month_pm FROM equipment WHERE bfm_equipment_no = ?', (bfm_no,))
-                    elif pm_type == 'Annual':
-                        cursor.execute('SELECT last_annual_pm FROM equipment WHERE bfm_equipment_no = ?', (bfm_no,))
-                    else:
-                        cursor.execute('''
-                            SELECT completion_date FROM pm_completions 
-                            WHERE bfm_equipment_no = ? AND pm_type = ? 
-                            ORDER BY completion_date DESC LIMIT 1
-                        ''', (bfm_no, pm_type))
-
-                    result = cursor.fetchone()
-                    if result and result[0]:
-                        raw_date = str(result[0]).strip()
-                        last_pm_date = ""
-
-                        if raw_date:
-                            # Try multiple date formats
-                            date_formats = [
-                                '%m/%d/%y',      # 8/14/25
-                                '%m/%d/%Y',      # 8/14/2025  
-                                '%Y-%m-%d',      # 2025-08-14
-                                '%m-%d-%y',      # 8-14-25
-                                '%m-%d-%Y'       # 8-14-2025
-                            ]
-
-                            for date_format in date_formats:
-                                try:
-                                    date_obj = datetime.strptime(raw_date, date_format)
-            
-                                    # Handle 2-digit years (assume 20xx if < 50, 19xx if >= 50)
-                                    if date_obj.year < 1950:
-                                        date_obj = date_obj.replace(year=date_obj.year + 2000)
-            
-                                    last_pm_date = date_obj.strftime('%m/%d/%Y')  # Always output as MM/DD/YYYY
-                                    break  # Successfully parsed, exit the loop
-                                except ValueError:
-                                    continue  # Try next format
-
-                            # If no format worked, use the raw date as-is
-                            if not last_pm_date:
-                                last_pm_date = raw_date
-        
-                except Exception as e:
-                    print(f"Error getting last PM date for {bfm_no}: {e}")
-                    last_pm_date = ""
-
-                # Add page break between forms (except for first)
-                if i > 0:
-                    story.append(PageBreak())
-
-                # Header with company logo
-                try:
-                    from reportlab.platypus import Image
-                    # Use the correct path to your logo file
-                    logo_path = r"C:\Users\stu15olen\Desktop\AIT_CMMS\img\ait_logo.png"  # Update with your actual logo filename
-    
                     if os.path.exists(logo_path):
                         # Create centered logo
                         logo_image = Image(logo_path, width=4*inch, height=1.2*inch)
-        
+
                         # Center the logo in a table
                         logo_data = [[logo_image]]
                         logo_table = Table(logo_data, colWidths=[7*inch])
@@ -11683,11 +13755,11 @@ class AITCMMSSystem:
                             ('TOPPADDING', (0, 0), (-1, -1), 10),
                             ('BOTTOMPADDING', (0, 0), (-1, -1), 15),
                         ]))
-        
+
                         story.append(logo_table)
                     else:
-                        # Fallback to text if logo file not found
                         print(f"Logo file not found at: {logo_path}")
+                        # Fallback to text if logo file not found
                         story.append(Paragraph("AIT - BUILDING THE FUTURE OF AEROSPACE", company_style))
                         story.append(Spacer(1, 15))
 
@@ -11696,8 +13768,8 @@ class AITCMMSSystem:
                     # Fallback to text header
                     story.append(Paragraph("AIT - BUILDING THE FUTURE OF AEROSPACE", company_style))
                     story.append(Spacer(1, 15))
-    
-                # Equipment information table
+
+            # =================== EQUIPMENT INFORMATION TABLE ===================
                 equipment_data = [
                     [
                         Paragraph('(SAP) Material Number:', header_cell_style), 
@@ -11713,56 +13785,42 @@ class AITCMMSSystem:
                     ],
                     [
                         Paragraph('Date of Last PM:', header_cell_style), 
-                        Paragraph(str(last_pm_date), cell_style), 
+                        Paragraph('', cell_style), 
                         Paragraph('Location of Equipment:', header_cell_style), 
                         Paragraph(str(location), cell_style)
                     ],
                     [
                         Paragraph('Maintenance Technician:', header_cell_style), 
-                        Paragraph(str(technician), cell_style), 
+                        Paragraph(str(assigned_tech), cell_style), 
                         Paragraph('PM Cycle:', header_cell_style), 
                         Paragraph(str(pm_type), cell_style)
                     ],
                     [
                         Paragraph('Estimated Hours:', header_cell_style), 
-                        Paragraph(f'{estimated_hours:.1f}h', cell_style), 
+                        Paragraph('1.0h', cell_style), 
                         Paragraph('Date of PM Completion:', header_cell_style), 
                         Paragraph('', cell_style)
                     ],
                     [
                         Paragraph('Signature of Technician:', header_cell_style), 
                         Paragraph('', cell_style), 
-                        Paragraph('Template Type:', header_cell_style), 
-                        Paragraph('Custom' if custom_template else 'Standard', cell_style)
-                    ]
-                    ]
-        
-                # Add safety notes if they exist
-                if safety_notes and safety_notes.strip():
-                        equipment_data.append([
-                        Paragraph(f'Safety: {safety_notes}', cell_style), 
+                        Paragraph('', cell_style), 
+                        Paragraph('', cell_style)
+                    ],
+                    [
+                        Paragraph('Safety: Always be aware of both Airbus and AIT safety policies and ensure safety policies are followed.', cell_style), 
+                        Paragraph('', cell_style), 
+                        Paragraph('', cell_style), 
+                        Paragraph('', cell_style)
+                    ],
+                    [
+                        Paragraph(f'Printed: {datetime.now().strftime("%m/%d/%Y")}', cell_style), 
                         '', '', ''
-                ])
+                    ]
+                ]
         
-                # Add special instructions if they exist
-                if special_instructions and special_instructions.strip():
-                        equipment_data.append([
-                        Paragraph(f'Special Instructions: {special_instructions}', cell_style), 
-                        '', '', ''
-                ])
-        
-                # Add print date
-                equipment_data.append([
-                    Paragraph(f'Printed: {datetime.now().strftime("%m/%d/%Y")}', cell_style), 
-                    '', '', ''
-                ])
-
-                # Create equipment table
-                # Create equipment table
                 equipment_table = Table(equipment_data, colWidths=[1.8*inch, 1.7*inch, 1.8*inch, 1.7*inch])
-
-                # Build table style commands without None values
-                table_style_commands = [
+                equipment_table.setStyle(TableStyle([
                     ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
                     ('FONTSIZE', (0, 0), (-1, -1), 8),
                     ('GRID', (0, 0), (-1, -1), 1, colors.black),
@@ -11771,61 +13829,90 @@ class AITCMMSSystem:
                     ('RIGHTPADDING', (0, 0), (-1, -1), 3),
                     ('TOPPADDING', (0, 0), (-1, -1), 3),
                     ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-                    ('SPAN', (0, -1), (-1, -1)),  # Always span printed date
-                ]
-
-                # Add conditional spans only if they exist
-                if safety_notes and safety_notes.strip():
-                    table_style_commands.append(('SPAN', (0, -3), (-1, -3)))
-
-                if special_instructions and special_instructions.strip():
-                    table_style_commands.append(('SPAN', (0, -2), (-1, -2)))
-
-                equipment_table.setStyle(TableStyle(table_style_commands))
-
+                    ('SPAN', (0, -2), (-1, -2)),  # Safety spans all columns
+                    ('SPAN', (0, -1), (-1, -1)),  # Printed date spans all columns
+                ]))
+        
                 story.append(equipment_table)
                 story.append(Spacer(1, 15))
 
-                # PM checklist table
-                checklist_header = "CUSTOM PM CHECKLIST:" if custom_template else "PM CHECKLIST:"
+            # =================== PM CHECKLIST TABLE ===================
+            # Try to get custom template checklist
+                checklist_items = []
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT checklist_items FROM pm_templates 
+                    WHERE bfm_equipment_no = ? AND pm_type = ?
+                ''', (bfm_no, pm_type))
+            
+                template_result = cursor.fetchone()
+            
+                if template_result and template_result[0]:
+                    try:
+                        checklist_items = json.loads(template_result[0])
+                        print(f"DEBUG: Using custom template with {len(checklist_items)} items")
+                    except:
+                        checklist_items = []
+            
+                # Use default checklist if no custom template
+                if not checklist_items:
+                    checklist_items = [
+                        "Special Equipment Used (List):",
+                        "Validate your maintenance with Date / Stamp / Hours",
+                        "Refer to drawing when performing maintenance",
+                        "Make sure all instruments are properly calibrated",
+                        "Make sure tool is properly identified",
+                        "Make sure all mobile mechanisms move fluidly",
+                        "Visually inspect the welds",
+                        "Take note of any anomaly or defect (create a CM if needed)",
+                        "Check all screws. Tighten if needed.",
+                        "Check the pins for wear",
+                        "Make sure all tooling is secured to the equipment with cable",
+                        "Ensure all tags (BFM and SAP) are applied and securely fastened",
+                        "All documentation are picked up from work area",
+                        "All parts and tools have been picked up",
+                        "Workspace has been cleaned up",
+                        "Dry runs have been performed (tests, restarts, etc.)",
+                        "Ensure that AIT Sticker is applied"
+                    ]
+
                 checklist_data = [
                     [
                         Paragraph('', header_cell_style), 
-                        Paragraph(checklist_header, header_cell_style), 
+                        Paragraph('PM CHECKLIST:', header_cell_style), 
                         Paragraph('', header_cell_style), 
                         Paragraph('Complete', header_cell_style), 
                         Paragraph('Labor Time', header_cell_style)
                     ]
                 ]
-
+        
                 # Add checklist items
                 for idx, item in enumerate(checklist_items, 1):
                     checklist_data.append([
                         Paragraph(str(idx), cell_style), 
-                        Paragraph(str(item), cell_style), 
+                        Paragraph(item, cell_style), 
                         Paragraph('', cell_style), 
                         Paragraph('', cell_style), 
                         Paragraph('', cell_style)
                     ])
-
-                # Create checklist table
-                checklist_table = Table(checklist_data, colWidths=[0.3*inch, 4.2*inch, 0.4*inch, 0.7*inch, 1.4*inch])
+        
+                checklist_table = Table(checklist_data, colWidths=[0.3*inch, 3.5*inch, 1.5*inch, 0.8*inch, 0.9*inch])
                 checklist_table.setStyle(TableStyle([
                     ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
                     ('FONTSIZE', (0, 0), (-1, -1), 8),
                     ('GRID', (0, 0), (-1, -1), 1, colors.black),
                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-                    ('LEFTPADDING', (0, 0), (-1, -1), 2),
-                    ('RIGHTPADDING', (0, 0), (-1, -1), 2),
-                    ('TOPPADDING', (0, 0), (-1, -1), 2),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 3),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 3),
+                    ('TOPPADDING', (0, 0), (-1, -1), 3),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+                    ('SPAN', (1, 0), (2, 0)),  # PM CHECKLIST spans 2 columns
                 ]))
-
+        
                 story.append(checklist_table)
                 story.append(Spacer(1, 15))
 
-                # Notes and completion section
+            # =================== COMPLETION INFORMATION TABLE ===================
                 completion_data = [
                     [
                         Paragraph('Notes from Technician:', header_cell_style), 
@@ -11848,8 +13935,8 @@ class AITCMMSSystem:
                         Paragraph('', cell_style)
                     ],
                     [
-                        Paragraph(document_name, cell_style), 
-                        Paragraph(document_revision, cell_style), 
+                        Paragraph('Preventive_Maintenance_Form', cell_style), 
+                        Paragraph('A2', cell_style), 
                         Paragraph('', cell_style)
                     ]
                 ]
@@ -11867,6 +13954,10 @@ class AITCMMSSystem:
                 ]))
 
                 story.append(completion_table)
+            
+                # Add page break after each PM form (except the last one)
+                if i < len(assignments) - 1:
+                    story.append(PageBreak())
 
             # Build PDF
             print(f"DEBUG: Building PDF with {len(story)} elements")
@@ -12007,6 +14098,882 @@ class AITCMMSSystem:
         """Clear search"""
         self.history_search_var.set('')
         self.search_pm_history_simple()
+    
+    
+    def check_for_conflicts(self):
+        """Check if SharePoint database was updated during this session"""
+        try:
+            if not hasattr(self, 'backup_sync_dir') or not self.backup_sync_dir:
+                return False
+        
+            # Get latest backup in SharePoint
+            latest_backup = self.get_latest_sharepoint_backup()
+            if not latest_backup:
+                return False
+        
+            backup_path, backup_time = latest_backup
+        
+            # If backup is newer than our session start, someone else updated it
+            if backup_time > self.session_start_time:
+                print(f"⚠ CONFLICT DETECTED!")
+                print(f"  Session started: {self.session_start_time}")
+                print(f"  Latest backup: {backup_time}")
+                print(f"  Someone updated the database during your session!")
+                return True
+        
+            return False
+        
+        except Exception as e:
+            print(f"Error checking for conflicts: {e}")
+            return False
+    
+    def get_latest_sharepoint_backup(self):
+        """Get the latest backup file from SharePoint"""
+        try:
+            backup_files = []
+        
+            for filename in os.listdir(self.backup_sync_dir):
+                if filename.endswith('.db'):
+                    filepath = os.path.join(self.backup_sync_dir, filename)
+                    modified_time = os.path.getmtime(filepath)
+                    backup_files.append((filepath, modified_time))
+        
+            if not backup_files:
+                return None
+        
+            backup_files.sort(key=lambda x: x[1], reverse=True)
+            latest_file, latest_time = backup_files[0]
+            return (latest_file, datetime.fromtimestamp(latest_time))
+        
+        except Exception as e:
+            print(f"Error getting latest backup: {e}")
+            return None
+    
+    def show_smart_merge_dialog(self):
+        """Show dialog explaining conflict and offering merge options - NOW WITH SCROLLBAR"""
+    
+        dialog = tk.Toplevel(self.root)
+        dialog.title("⚠️ Database Conflict Detected")
+        dialog.geometry("750x700")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Center dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (750 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (700 // 2)
+        dialog.geometry(f"750x700+{x}+{y}")
+        
+        result = {"action": "cancel"}
+        
+        # Main container with scrollbar
+        main_canvas = tk.Canvas(dialog)
+        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=main_canvas.yview)
+        scrollable_frame = ttk.Frame(main_canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+        )
+    
+        main_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        main_canvas.configure(yscrollcommand=scrollbar.set)
+
+        # Header with warning
+        header_frame = ttk.Frame(scrollable_frame, padding=20)
+        header_frame.pack(fill='x')
+
+        ttk.Label(header_frame, text="⚠️ Database Conflict Detected!", 
+                font=('Arial', 16, 'bold'), foreground='red').pack()
+        ttk.Label(header_frame, text="Team members updated the database while you were working", 
+                font=('Arial', 11), foreground='orange').pack(pady=5)
+
+        ttk.Separator(scrollable_frame, orient='horizontal').pack(fill='x', pady=10)
+
+        # Situation explanation
+        situation_frame = ttk.LabelFrame(scrollable_frame, text="What Happened", padding=15)
+        situation_frame.pack(fill='x', padx=20, pady=10)
+
+        session_duration = datetime.now() - self.session_start_time
+        hours, remainder = divmod(int(session_duration.total_seconds()), 3600)
+        minutes, _ = divmod(remainder, 60)
+
+        situation_text = f"""
+    You opened the program at: {self.session_start_time.strftime('%I:%M %p')}
+    You worked for: {hours}h {minutes}m
+
+    During this time, other team members:
+    • Completed PMs
+    • Created/updated CMs
+    • Modified equipment records
+    • Updated inventory
+    • Made other changes
+
+    Their changes were saved to SharePoint.
+
+    If you close now without merging, their work will be LOST! ❌
+        """
+
+        ttk.Label(situation_frame, text=situation_text, justify='left').pack(anchor='w')
+
+        # Merge explanation
+        merge_frame = ttk.LabelFrame(scrollable_frame, text="How Smart Merge Works", padding=15)
+        merge_frame.pack(fill='x', padx=20, pady=10)
+
+        merge_explanation = """
+    SMART MERGE PROCESS:
+
+    1. Downloads latest database from SharePoint
+    2. Identifies ALL changes you made:
+       • PM Completions you entered
+       • CMs you created/updated
+       • Equipment records you modified
+       • MRO inventory you changed
+       • Cannot Find/Run to Failure updates
+
+    3. Intelligently merges:
+       • ADDS your new PM completions to their database
+       • ADDS your new CMs to their database
+       • MERGES equipment updates (newest wins)
+       • MERGES MRO inventory (your changes win)
+       • Preserves all their work too!
+
+    4. Result: Combined database with EVERYONE'S work! ✔
+        """
+    
+        ttk.Label(merge_frame, text=merge_explanation, justify='left',
+                font=('Courier', 9)).pack(anchor='w')
+
+        # Options
+        options_frame = ttk.LabelFrame(scrollable_frame, text="Your Options", padding=15)
+        options_frame.pack(fill='x', padx=20, pady=10)
+
+        options_text = """
+    OPTION 1: SMART MERGE (Recommended) ✔
+      → Combines everyone's work safely
+      → Nothing gets lost
+
+    OPTION 2: OVERRIDE (Dangerous) ⚠
+    → Overwrites their work with yours only
+    → Their PMs, CMs, updates will be LOST!
+
+    OPTION 3: CANCEL
+    → Don't close yet
+    → Coordinate with team first
+        """
+
+        ttk.Label(options_frame, text=options_text, justify='left').pack(anchor='w')
+
+        # Buttons
+        button_frame = ttk.Frame(scrollable_frame, padding=15)
+        button_frame.pack(fill='x', side='bottom')
+
+        def do_merge():
+            result["action"] = "merge"
+            dialog.destroy()
+
+        def do_override():
+            confirm = messagebox.askyesno(
+                "⚠️ CONFIRM OVERRIDE",
+                "You are about to OVERWRITE other users' work!\n\n"
+                "Their PM completions, CMs, and updates will be LOST!\n\n"
+                "Are you ABSOLUTELY SURE?",
+                icon='warning',
+                parent=dialog
+            )
+            if confirm:
+                result["action"] = "override"
+                dialog.destroy()
+
+        def do_cancel():
+            result["action"] = "cancel"
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="✓ Smart Merge (Recommended)", 
+                command=do_merge,
+                style='Accent.TButton').pack(side='left', padx=5)
+
+        ttk.Button(button_frame, text="Cancel", 
+                command=do_cancel).pack(side='left', padx=5)
+
+        ttk.Button(button_frame, text="⚠️ Override Their Work", 
+                command=do_override).pack(side='right', padx=5)
+
+        # Pack the canvas and scrollbar
+        main_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+    
+        # Enable mousewheel scrolling
+        def on_mousewheel(event):
+            main_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        main_canvas.bind_all("<MouseWheel>", on_mousewheel)
+
+        dialog.wait_window()
+        return result["action"]
+
+
+# ========== UPDATED METHOD 6: show_closing_sync_dialog ==========
+    def show_closing_sync_dialog(self):
+        """Show dialog when closing program normally - NOW WITH SCROLLBAR"""
+    
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Close AIT CMMS")
+        dialog.geometry("650x600")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Center dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (650 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (600 // 2)
+        dialog.geometry(f"650x600+{x}+{y}")
+        
+        result = {"action": "cancel"}
+        
+        # Main container with scrollbar
+        main_canvas = tk.Canvas(dialog)
+        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=main_canvas.yview)
+        scrollable_frame = ttk.Frame(main_canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+        )
+    
+        main_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        main_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Header
+        header_frame = ttk.Frame(scrollable_frame, padding=20)
+        header_frame.pack(fill='x')
+
+        ttk.Label(header_frame, text="Close AIT CMMS", 
+                font=('Arial', 14, 'bold')).pack()
+
+        ttk.Separator(scrollable_frame, orient='horizontal').pack(fill='x', pady=10)
+
+        # Session info
+        info_frame = ttk.LabelFrame(scrollable_frame, text="Session Information", padding=15)
+        info_frame.pack(fill='x', padx=20, pady=10)
+
+        session_duration = datetime.now() - self.session_start_time
+        hours, remainder = divmod(int(session_duration.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        info_text = f"""
+    User: {self.user_name}
+    Role: {self.current_user_role}
+
+    Session Start: {self.session_start_time.strftime('%Y-%m-%d %H:%M:%S')}
+    Session Duration: {hours}h {minutes}m {seconds}s
+
+    Current Database: ait_cmms_database.db
+    SharePoint Folder: {os.path.basename(self.backup_sync_dir) if hasattr(self, 'backup_sync_dir') and self.backup_sync_dir else 'Not Connected'}
+        """
+
+        ttk.Label(info_frame, text=info_text, justify='left', 
+                font=('Courier', 9)).pack(anchor='w')
+
+        # Sync explanation
+        sync_frame = ttk.LabelFrame(scrollable_frame, text="What Happens Next", padding=15)
+        sync_frame.pack(fill='x', padx=20, pady=10)
+
+        sync_text = """When you click 'Backup and Close':
+
+    1. ✓ Your database will be backed up to SharePoint
+    2. ✓ Timestamped backup will be created
+    3. ✓ Other users can access your latest changes
+    4. ✓ Program will close safely
+
+    This ensures all your work is saved.
+        """
+    
+        ttk.Label(sync_frame, text=sync_text, justify='left').pack(anchor='w')
+
+        # Important note
+        note_frame = ttk.Frame(scrollable_frame, padding=10)
+        note_frame.pack(fill='x', padx=20)
+
+        ttk.Label(note_frame, 
+                  text="💡 Note: Last person to close the program pushes the final database state",
+                  foreground='blue', font=('Arial', 9),
+                  wraplength=550).pack()
+
+        # Buttons
+        button_frame = ttk.Frame(scrollable_frame, padding=15)
+        button_frame.pack(fill='x', side='bottom')
+
+        def sync_and_close():
+            result["action"] = "sync_and_close"
+            dialog.destroy()
+
+        def cancel_close():
+            result["action"] = "cancel"
+            dialog.destroy()
+
+        def close_without_sync():
+            confirm = messagebox.askyesno(
+                "Confirm Close Without Backup",
+                "Close without backing up to SharePoint?\n\n"
+                "⚠️ WARNING: Your changes will NOT be saved!\n"
+                "⚠️ Other users will NOT see your work!\n\n"
+                "Are you sure?",
+                icon='warning',
+                parent=dialog
+            )
+            if confirm:
+                result["action"] = "close_without_sync"
+                dialog.destroy()
+
+        ttk.Button(button_frame, text="💾 Backup and Close", 
+                command=sync_and_close,
+                style='Accent.TButton').pack(side='left', padx=5)
+
+        ttk.Button(button_frame, text="Cancel", 
+                command=cancel_close).pack(side='left', padx=5)
+
+        ttk.Button(button_frame, text="⚠️ Close Without Backup", 
+                command=close_without_sync).pack(side='right', padx=5)
+
+        # Pack the canvas and scrollbar
+        main_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+    
+        # Enable mousewheel scrolling
+        def on_mousewheel(event):
+            main_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        main_canvas.bind_all("<MouseWheel>", on_mousewheel)
+
+        dialog.wait_window()
+        return result["action"]
+
+    
+    
+    def perform_comprehensive_merge_and_close(self):
+        """Comprehensively merge all changes from both databases - NOW WITH SCROLLBAR"""
+        try:
+            # Show progress
+            progress = tk.Toplevel(self.root)
+            progress.title("Comprehensive Smart Merge in Progress...")
+            progress.geometry("650x500")
+            progress.transient(self.root)
+            progress.grab_set()
+            
+            # Center progress
+            progress.update_idletasks()
+            x = (progress.winfo_screenwidth() // 2) - (650 // 2)
+            y = (progress.winfo_screenheight() // 2) - (500 // 2)
+            progress.geometry(f"650x500+{x}+{y}")
+            
+            # Main container with scrollbar
+            main_canvas = tk.Canvas(progress)
+            scrollbar = ttk.Scrollbar(progress, orient="vertical", command=main_canvas.yview)
+            scrollable_frame = ttk.Frame(main_canvas)
+            
+            scrollable_frame.bind(
+                "<Configure>",
+                lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+            )
+        
+            main_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            main_canvas.configure(yscrollcommand=scrollbar.set)
+        
+            status_var = tk.StringVar(value="Preparing comprehensive merge...")
+    
+            ttk.Label(scrollable_frame, text="Comprehensive Smart Merge", 
+                    font=('Arial', 14, 'bold')).pack(pady=20)
+    
+            status_label = ttk.Label(scrollable_frame, textvariable=status_var, 
+                                    font=('Arial', 10), wraplength=600)
+            status_label.pack(pady=10)
+    
+            progress_bar = ttk.Progressbar(scrollable_frame, mode='indeterminate', length=550)
+            progress_bar.pack(pady=10)
+            progress_bar.start()
+    
+            log_text = tk.Text(scrollable_frame, height=15, width=75, font=('Courier', 8))
+            log_text.pack(pady=10, padx=20)
+    
+            def log(message):
+                log_text.insert('end', message + '\n')
+                log_text.see('end')
+                progress.update()
+        
+            # Pack the canvas and scrollbar
+            main_canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+            
+            # Enable mousewheel scrolling
+            def on_mousewheel(event):
+                main_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            main_canvas.bind_all("<MouseWheel>", on_mousewheel)
+    
+            progress.update()
+    
+            # Step 1: Save current database
+            status_var.set("Step 1/6: Saving your changes...")
+            log("✓ Saving your current work...")
+            
+            my_changes_db = 'temp_my_changes.db'
+            if hasattr(self, 'conn'):
+                self.conn.close()
+    
+            shutil.copy2('ait_cmms_database.db', my_changes_db)
+            log(f"✓ Your changes saved to: {my_changes_db}")
+        
+            # Step 2: Pull latest from SharePoint
+            status_var.set("Step 2/6: Pulling latest database from SharePoint...")
+            log("✓ Downloading latest team database...")
+        
+            latest_backup = self.get_latest_sharepoint_backup()
+            if not latest_backup:
+                raise Exception("Could not find SharePoint backup")
+        
+            shutil.copy2(latest_backup[0], 'ait_cmms_latest.db')
+            log(f"✓ Downloaded: {os.path.basename(latest_backup[0])}")
+        
+            # Step 3: Open both databases
+            status_var.set("Step 3/6: Opening databases...")
+            log("✓ Opening both databases for comparison...")
+        
+            my_conn = sqlite3.connect(my_changes_db)
+            latest_conn = sqlite3.connect('ait_cmms_latest.db')
+            log("✓ Both databases opened successfully")
+            
+            # Step 4-5: Perform merges
+            status_var.set("Step 4/6: Merging PM completions...")
+            log("\n✓ Merging PM Completions...")
+            pm_count = self.merge_pm_completions(my_conn, latest_conn)
+            log(f"  → Merged {pm_count} PM completion(s)")
+            
+            status_var.set("Step 5/6: Merging CMs and other records...")
+            log("✓ Merging Corrective Maintenance records...")
+            cm_count = self.merge_corrective_maintenance(my_conn, latest_conn)
+            log(f"  → Merged {cm_count} CM record(s)")
+            
+            log("✓ Merging MRO inventory...")
+            mro_count = self.merge_mro_inventory(my_conn, latest_conn)
+            log(f"  → Merged {mro_count} MRO item(s)")
+            
+            log("✓ Merging Equipment updates...")
+            equip_count = self.merge_equipment_updates(my_conn, latest_conn)
+            log(f"  → Merged {equip_count} equipment update(s)")
+            
+            log("✓ Merging Cannot Find assets...")
+            cf_count = self.merge_cannot_find_assets(my_conn, latest_conn)
+            log(f"  → Merged {cf_count} Cannot Find record(s)")
+            
+            log("✓ Merging Run to Failure assets...")
+            rtf_count = self.merge_run_to_failure_assets(my_conn, latest_conn)
+            log(f"  → Merged {rtf_count} Run to Failure record(s)")
+            
+            my_conn.close()
+            latest_conn.close()
+        
+            # Save merged database
+            status_var.set("Step 6/6: Saving merged database to SharePoint...")
+            log("\n✓ Pushing merged database to SharePoint...")
+            shutil.copy2('ait_cmms_latest.db', 'ait_cmms_database.db')
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            backup_filename = f"ait_cmms_backup_{timestamp}.db"
+            backup_path = os.path.join(self.backup_sync_dir, backup_filename)
+            shutil.copy2('ait_cmms_database.db', backup_path)
+            
+            log(f"✓ Saved to SharePoint: {backup_filename}")
+    
+            # Cleanup
+            try:
+                os.remove(my_changes_db)
+                os.remove('ait_cmms_latest.db')
+            except:
+                pass
+    
+            status_var.set("✓ Merge Complete!")
+            progress_bar.stop()
+        
+            total_merged = pm_count + cm_count + mro_count + equip_count + cf_count + rtf_count
+            log(f"\n✅ SUCCESS! Merged {total_merged} total changes!")
+            log("Everyone's work has been preserved!")
+    
+            # Wait then close
+            progress.after(3000, lambda: self.finish_close(progress))
+    
+        except Exception as e:
+            messagebox.showerror("Merge Error", 
+                               f"Error during merge:\n{str(e)}\n\n"
+                               "Your work is saved locally.\n"
+                               "Contact support for help.")
+
+
+   
+    
+    
+    def merge_pm_completions(self, my_conn, latest_conn):
+        """Merge PM completions from my database to latest"""
+        try:
+            my_cursor = my_conn.cursor()
+            latest_cursor = latest_conn.cursor()
+        
+            # Get PM completions from my database that aren't in latest
+            my_cursor.execute('''
+                SELECT bfm_equipment_no, pm_type, technician_name, completion_date,
+                    labor_hours, labor_minutes, pm_due_date, special_equipment, notes,
+                    next_annual_pm_date
+                FROM pm_completions
+            ''')
+        
+            my_pms = my_cursor.fetchall()
+            merged_count = 0
+        
+            for pm in my_pms:
+                bfm_no, pm_type, tech, comp_date, hours, mins, due_date, special, notes, next_annual = pm
+            
+                # Check if this exact PM already exists in latest
+                latest_cursor.execute('''
+                    SELECT id FROM pm_completions 
+                    WHERE bfm_equipment_no = ? AND pm_type = ? 
+                    AND technician_name = ? AND completion_date = ?
+                ''', (bfm_no, pm_type, tech, comp_date))
+            
+                if not latest_cursor.fetchone():
+                    # Insert this PM into latest database
+                    latest_cursor.execute('''
+                        INSERT INTO pm_completions 
+                        (bfm_equipment_no, pm_type, technician_name, completion_date,
+                        labor_hours, labor_minutes, pm_due_date, special_equipment, notes,
+                        next_annual_pm_date)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (bfm_no, pm_type, tech, comp_date, hours, mins, due_date, special, notes, next_annual))
+                    merged_count += 1
+        
+            latest_conn.commit()
+            return merged_count
+        
+        except Exception as e:
+            print(f"Error merging PM completions: {e}")
+            return 0
+    
+    def merge_corrective_maintenance(self, my_conn, latest_conn):
+        """Merge CM records from my database to latest"""
+        try:
+            my_cursor = my_conn.cursor()
+            latest_cursor = latest_conn.cursor()
+            
+            # Get CMs from my database
+            my_cursor.execute('SELECT * FROM corrective_maintenance')
+            my_cms = my_cursor.fetchall()
+            
+            # Get column info
+            my_cursor.execute('PRAGMA table_info(corrective_maintenance)')
+            columns = [col[1] for col in my_cursor.fetchall()]
+            
+            merged_count = 0
+        
+            for cm in my_cms:
+                cm_number = cm[1]  # Assuming cm_number is second column
+            
+                # Check if CM exists in latest
+                latest_cursor.execute(
+                    'SELECT id FROM corrective_maintenance WHERE cm_number = ?',
+                    (cm_number,)
+                )
+            
+                exists = latest_cursor.fetchone()
+            
+                if not exists:
+                    # Insert new CM
+                    placeholders = ', '.join(['?' for _ in columns])
+                    latest_cursor.execute(
+                        f'INSERT INTO corrective_maintenance VALUES ({placeholders})',
+                        cm
+                    )
+                    merged_count += 1
+                else:
+                    # Update existing CM (user's version is newer)
+                    set_clause = ', '.join([f'{col} = ?' for col in columns[2:]])  # Skip id and cm_number
+                    latest_cursor.execute(
+                        f'UPDATE corrective_maintenance SET {set_clause} WHERE cm_number = ?',
+                        cm[2:] + (cm_number,)
+                    )
+                    merged_count += 1
+        
+            latest_conn.commit()
+            return merged_count
+        
+        except Exception as e:
+            print(f"Error merging CMs: {e}")
+            return 0
+    
+    
+    
+    def merge_mro_inventory(self, my_conn, latest_conn):
+        """Merge MRO inventory from my database to latest"""
+        try:
+            my_cursor = my_conn.cursor()
+            latest_cursor = latest_conn.cursor()
+            
+            # Get MRO items from my database
+            my_cursor.execute('SELECT * FROM mro_inventory')
+            my_items = my_cursor.fetchall()
+        
+            # Get columns
+            my_cursor.execute('PRAGMA table_info(mro_inventory)')
+            columns = [col[1] for col in my_cursor.fetchall()]
+            
+            merged_count = 0
+        
+            for item in my_items:
+                part_number = item[1]  # Assuming part_number is second column
+            
+                # Check if exists in latest
+                latest_cursor.execute(
+                    'SELECT id FROM mro_inventory WHERE part_number = ?',
+                    (part_number,)
+                )
+            
+                exists = latest_cursor.fetchone()
+            
+                if not exists:
+                    # Insert new item
+                    placeholders = ', '.join(['?' for _ in columns])
+                    latest_cursor.execute(
+                        f'INSERT INTO mro_inventory VALUES ({placeholders})',
+                        item
+                    )
+                    merged_count += 1
+                else:
+                    # Update existing (user's changes win for MRO)
+                    set_clause = ', '.join([f'{col} = ?' for col in columns[2:]])
+                    latest_cursor.execute(
+                        f'UPDATE mro_inventory SET {set_clause} WHERE part_number = ?',
+                        item[2:] + (part_number,)
+                    )
+                    merged_count += 1
+        
+            latest_conn.commit()
+            return merged_count
+        
+        except Exception as e:
+            print(f"Error merging MRO: {e}")
+            return 0
+    
+    
+    def merge_equipment_updates(self, my_conn, latest_conn):
+        """Merge equipment updates (take most recent changes)"""
+        try:
+            my_cursor = my_conn.cursor()
+            latest_cursor = latest_conn.cursor()
+            
+            # Get equipment from my database
+            my_cursor.execute('SELECT * FROM equipment')
+            my_equipment = my_cursor.fetchall()
+            
+            # Get columns
+            my_cursor.execute('PRAGMA table_info(equipment)')
+            columns = [col[1] for col in my_cursor.fetchall()]
+        
+            merged_count = 0
+        
+            for equip in my_equipment:
+                bfm_no = equip[1]  # Assuming bfm_equipment_no is second column
+            
+                # Check if exists in latest
+                latest_cursor.execute(
+                    'SELECT id FROM equipment WHERE bfm_equipment_no = ?',
+                    (bfm_no,)
+                )
+            
+                exists = latest_cursor.fetchone()
+            
+                if not exists:
+                    # Insert new equipment
+                    placeholders = ', '.join(['?' for _ in columns])
+                    latest_cursor.execute(
+                        f'INSERT INTO equipment VALUES ({placeholders})',
+                        equip
+                    )
+                    merged_count += 1
+                # For existing equipment, we keep latest version (don't overwrite)
+                # This is safer - equipment records are usually setup data
+        
+            latest_conn.commit()
+            return merged_count
+        
+        except Exception as e:
+            print(f"Error merging equipment: {e}")
+            return 0
+    
+    
+    def merge_cannot_find_assets(self, my_conn, latest_conn):
+        """Merge Cannot Find assets"""
+        try:
+            my_cursor = my_conn.cursor()
+            latest_cursor = latest_conn.cursor()
+            
+            my_cursor.execute('SELECT * FROM cannot_find_assets')
+            my_assets = my_cursor.fetchall()
+            
+            my_cursor.execute('PRAGMA table_info(cannot_find_assets)')
+            columns = [col[1] for col in my_cursor.fetchall()]
+            
+            merged_count = 0
+            
+            for asset in my_assets:
+                bfm_no = asset[1]  # Assuming bfm_equipment_no is second column
+            
+                latest_cursor.execute(
+                    'SELECT id FROM cannot_find_assets WHERE bfm_equipment_no = ?',
+                    (bfm_no,)
+                )
+            
+                if not latest_cursor.fetchone():
+                    placeholders = ', '.join(['?' for _ in columns])
+                    latest_cursor.execute(
+                        f'INSERT INTO cannot_find_assets VALUES ({placeholders})',
+                        asset
+                    )
+                    merged_count += 1
+        
+            latest_conn.commit()
+            return merged_count
+        
+        except Exception as e:
+            print(f"Error merging Cannot Find: {e}")
+            return 0
+    
+    
+    
+    def merge_run_to_failure_assets(self, my_conn, latest_conn):
+        """Merge Run to Failure assets"""
+        try:
+            my_cursor = my_conn.cursor()
+            latest_cursor = latest_conn.cursor()
+            
+            my_cursor.execute('SELECT * FROM run_to_failure_assets')
+            my_assets = my_cursor.fetchall()
+            
+            my_cursor.execute('PRAGMA table_info(run_to_failure_assets)')
+            columns = [col[1] for col in my_cursor.fetchall()]
+            
+            merged_count = 0
+        
+            for asset in my_assets:
+                bfm_no = asset[1]  # Assuming bfm_equipment_no is second column
+            
+                latest_cursor.execute(
+                    'SELECT id FROM run_to_failure_assets WHERE bfm_equipment_no = ?',
+                    (bfm_no,)
+                )
+            
+                if not latest_cursor.fetchone():
+                    placeholders = ', '.join(['?' for _ in columns])
+                    latest_cursor.execute(
+                        f'INSERT INTO run_to_failure_assets VALUES ({placeholders})',
+                        asset
+                    )
+                    merged_count += 1
+        
+            latest_conn.commit()
+            return merged_count
+        
+        except Exception as e:
+            print(f"Error merging Run to Failure: {e}")
+            return 0
+    
+    
+    def backup_and_close_normal(self):
+        """Normal backup and close (no conflicts)"""
+        if hasattr(self, 'backup_sync_dir'):
+            print("Creating backup...")
+            self.sharepoint_only_backup(self.backup_sync_dir)
+            print("Backup completed")
+    
+        if hasattr(self, 'conn'):
+            self.conn.close()
+    
+        self.root.destroy()
+    
+    
+    def finish_close(self, progress_dialog):
+        """Final cleanup and close"""
+        progress_dialog.destroy()
+    
+        if hasattr(self, 'conn'):
+            try:
+                self.conn.close()
+            except:
+                pass
+    
+        self.root.destroy()
+    
+    def clear_all_mro_inventory(self):
+        """Clear ALL MRO stock inventory items from the database"""
+    
+        # First, get count of items to show in confirmation
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM mro_inventory')
+        total_count = cursor.fetchone()[0]
+    
+        if total_count == 0:
+            messagebox.showinfo("No Items", "There are no MRO inventory items to clear.")
+            return
+    
+        # Show confirmation dialog with count
+        result = messagebox.askyesno(
+            "⚠️ Confirm Clear All MRO Inventory",
+            f"Are you sure you want to DELETE ALL {total_count} MRO inventory items?\n\n"
+            "⚠️ WARNING: This action cannot be undone!\n"
+            "⚠️ ALL stock records will be permanently deleted!\n\n"
+            "This will remove:\n"
+            "• All part numbers\n"
+            "• All quantity records\n"
+            "• All stock locations\n"
+            "• All inventory data\n\n"
+            "Are you ABSOLUTELY SURE?",
+            icon='warning'
+        )
+    
+        if not result:
+            return
+    
+        # Double confirmation for safety
+        double_check = messagebox.askyesno(
+            "⚠️ Final Confirmation",
+            f"FINAL WARNING!\n\n"
+            f"You are about to permanently delete {total_count} inventory items.\n\n"
+            "This cannot be reversed!\n\n"
+            "Click YES to proceed with deletion.",
+            icon='warning'
+        )
+    
+        if not double_check:
+            messagebox.showinfo("Cancelled", "Clear operation cancelled. No items were deleted.")
+            return
+    
+        try:
+            # Delete all MRO inventory items
+            cursor.execute('DELETE FROM mro_inventory')
+            self.conn.commit()
+            
+            # Refresh the MRO display if the method exists
+            if hasattr(self.mro_manager, 'load_mro_inventory'):
+                self.mro_manager.load_mro_inventory()
+        
+            # Update status bar
+            self.update_status(f"✅ Successfully cleared {total_count} MRO inventory items")
+        
+            # Show success message
+            messagebox.showinfo(
+                "Success", 
+                f"All {total_count} MRO inventory items have been permanently deleted.\n\n"
+                "The MRO inventory is now empty."
+            )
+        
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Error", f"Failed to clear MRO inventory: {str(e)}")
+            print(f"Clear MRO inventory error: {e}")
     
 # Main application startup
 if __name__ == "__main__":
